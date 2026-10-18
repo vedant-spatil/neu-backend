@@ -1,0 +1,23 @@
+.env
+.venv/
+data/
+docs/*.csv
+__pycache__/
+*.log
+.pytest_cache/
+.ruff_cache/
+*/__pycache__/
+docs/
+
+# Migration (plan.md section 22): code moves to app/ml, these stay local only
+third_party/
+artifacts/
+external/
+pipeline/
+mainvenv/
+
+# Model checkpoints and tool caches: not source, never pushed
+models/
+graphify-out/
+
+migrations/

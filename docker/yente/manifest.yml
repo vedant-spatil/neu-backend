@@ -1,0 +1,11 @@
+# yente manifest: index only the sanctions and PEP collections (plan 16.4).
+# Source: https://www.opensanctions.org/docs/yente/datasets/
+# Licence: CC BY-NC 4.0 bulk data, non-commercial use only.
+# One catalog entry with scopes avoids duplicate dataset names (yente rejects duplicates).
+catalogs:
+  - url: "https://data.opensanctions.org/datasets/latest/index.json"
+    scopes:
+      - sanctions
+      - peps
+    resource_name: entities.ftm.json
+datasets: []

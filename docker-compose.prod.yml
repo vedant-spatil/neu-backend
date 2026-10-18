@@ -1,0 +1,130 @@
+# Production stack for one EC2 instance (plan.md section 23).
+#
+# First time:   scripts/ec2_bootstrap.sh, then copy .env.example to .env and fill it in,
+#               then scripts/issue_cert.sh
+# Start:        docker compose -f docker-compose.prod.yml up -d
+# Logs:         docker compose -f docker-compose.prod.yml logs -f api
+#
+# Only nginx publishes ports (80, 443). Postgres, Elasticsearch, yente, Neo4j and the API stay on the
+# internal Docker network. mem_limit values are caps, not expected usage.
+name: aml-prod
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aml
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: aml
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aml -d aml"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 1g
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"   # internal network only; never published
+      ES_JAVA_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+
+  yente:
+    image: ghcr.io/opensanctions/yente:latest
+    restart: unless-stopped
+    environment:
+      YENTE_INDEX_TYPE: elasticsearch
+      YENTE_INDEX_URL: http://elasticsearch:9200
+      YENTE_MANIFEST: /manifest.yml
+    volumes:
+      - ./docker/yente/manifest.yml:/manifest.yml:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 1g
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: aml-api:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_ENV: prod   # refuses the dev JWT secret and Neo4j password (app/config.py)
+      DATABASE_URL: postgresql+psycopg://aml:${POSTGRES_PASSWORD}@postgres:5432/aml
+      NEO4J_URI: bolt://neo4j:7687
+      YENTE_URL: http://yente:8000
+    expose:
+      - "8000"   # reached only by nginx
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      yente:
+        condition: service_started
+    mem_limit: 1g
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      NGINX_ENVSUBST_FILTER: API_DOMAIN   # only substitute our variable, not nginx's own $host etc.
+    volumes:
+      - ./docker/nginx/templates:/etc/nginx/templates:ro
+      - letsencrypt:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 128m
+
+  # Only used by scripts/issue_cert.sh (profile "cert"), never started by a plain "up -d".
+  certbot:
+    image: certbot/certbot:latest
+    profiles: ["cert"]
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+
+volumes:
+  pgdata:
+  esdata:
+  neo4jdata:
+  letsencrypt:
+  certbot_www:

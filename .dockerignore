@@ -1,0 +1,23 @@
+# Keep secrets, local environments and data out of the build context (plan.md section 23).
+.env
+.env.*
+!.env.example
+.git
+mainvenv
+.venv
+external
+third_party
+docs
+data
+models
+artifacts
+pipeline
+tests
+graphify-out
+plan.md
+CLAUDE.md
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+*.log

@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aml
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aml}
+      POSTGRES_DB: aml
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aml -d aml"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me-neo4j}
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  yente:
+    image: ghcr.io/opensanctions/yente:latest
+    environment:
+      YENTE_INDEX_TYPE: elasticsearch
+      YENTE_INDEX_URL: http://elasticsearch:9200
+      YENTE_MANIFEST: /manifest.yml
+    volumes:
+      - ./docker/yente/manifest.yml:/manifest.yml:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx2g"
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+# Disabled: Celery and Redis. The redis and worker services are commented out.
+#  redis:
+#    image: redis:7-alpine
+#    ports:
+#      - "6379:6379"
+#    healthcheck:
+#      test: ["CMD", "redis-cli", "ping"]
+#      interval: 5s
+#      timeout: 3s
+#      retries: 20
+#
+#  worker:
+#    build:
+#      context: .
+#      dockerfile: docker/api.Dockerfile
+#    command: ["celery", "-A", "app.tasks", "worker", "--concurrency=1", "--loglevel=info"]
+#    env_file: .env
+#    environment:
+#      DATABASE_URL: postgresql+psycopg://aml:${POSTGRES_PASSWORD:-aml}@postgres:5432/aml
+#      NEO4J_URI: bolt://neo4j:7687
+#      YENTE_URL: http://yente:8000
+#      REDIS_URL: redis://redis:6379/0
+#    depends_on:
+#      redis:
+#        condition: service_healthy
+#      postgres:
+#        condition: service_healthy
+#      neo4j:
+#        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://aml:${POSTGRES_PASSWORD:-aml}@postgres:5432/aml
+      NEO4J_URI: bolt://neo4j:7687
+      YENTE_URL: http://yente:8000
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      yente:
+        condition: service_started
+
+volumes:
+  pgdata:
+  neo4jdata:
+  esdata:
