@@ -25,7 +25,8 @@ if [ "${1:-}" = "--renew" ]; then
 fi
 
 # 1. Databases, search, sanctions and the API. nginx waits for the API to be healthy.
-$COMPOSE up -d postgres elasticsearch yente neo4j api
+#    --build: aml-api is built on this host, not pulled from a registry (first run has no image yet).
+$COMPOSE up -d --build postgres elasticsearch yente neo4j api
 
 # 2. nginx refuses to start without a certificate file, so create a short-lived placeholder first.
 docker run --rm -v "$LE_VOLUME:/etc/letsencrypt" alpine:3.20 sh -c "

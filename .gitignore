@@ -19,5 +19,3 @@ mainvenv/
 # Model checkpoints and tool caches: not source, never pushed
 models/
 graphify-out/
-
-migrations/
