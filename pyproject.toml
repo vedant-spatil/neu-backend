@@ -39,6 +39,10 @@ ml = [
     "wandb>=0.17",
     "tqdm>=4.66",
     "munch>=4.0",
+    # Triage model (app/ml/triage_*): tree model, SHAP reason codes, Parquet feature files.
+    "xgboost>=2.0",
+    "shap>=0.45",
+    "pyarrow>=16.0",
 ]
 
 [tool.uv]

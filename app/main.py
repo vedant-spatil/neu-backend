@@ -11,8 +11,11 @@ from app.config import get_settings
 async def lifespan(_: FastAPI):
     # Create LangGraph checkpoint tables once, before any request can start a case.
     from app.orchestration.graph import get_graph
+    from app.services.sync import fail_interrupted_imports
 
     get_graph()
+    # A sync thread does not survive a restart, so any import still busy at startup was interrupted.
+    fail_interrupted_imports()
     yield
 
 

@@ -1,32 +1,33 @@
-"""CSV upload, preview and validation (ETL stages 1 and 2). Loading stays in app.ingest.load.
+"""CSV upload (ETL stage 1), column mapping and sync. Loading and triage run in app.services.sync.
 
-Admin only. Uploads stream to disk, never into memory, and are stored under their SHA-256 so the
-same file cannot be imported twice under two names."""
+Admin only. Uploads stream to disk, never into memory, and are stored under their SHA-256 so the same file cannot
+be imported twice under two names. The flow is: upload, read the columns, map them to the schema (names that match
+are filled in automatically), then sync. Sync validates the file, loads it and opens cases for the top alerts."""
 
 import hashlib
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session, require_role
+from app.api.deps import db_session, require_role
 from app.db.models import Import, User
+from app.ingest.mapping import SCHEMA, auto_map, mapping_problems, read_header
+from app.services.sync import BUSY_STATUSES, can_reset, is_live, start_sync
 
 router = APIRouter(prefix="/api/imports", tags=["imports"])
 
 UPLOAD_DIR = Path(__file__).resolve().parents[3] / "data" / "uploads"
 MAX_BYTES = 2 * 1024**3  # 2 GB
-REQUIRED = [
-    "Timestamp", "From Bank", "Account", "To Bank", "Account",
-    "Amount Received", "Receiving Currency", "Amount Paid", "Payment Currency",
-    "Payment Format", "Is Laundering",
-]
-
 
 _admin = require_role("admin")
+
+
+class SyncIn(BaseModel):
+    mapping: dict[str, str]  # schema field -> CSV column
 
 
 def _store(upload: UploadFile) -> tuple[Path, str, int]:
@@ -50,28 +51,18 @@ def _store(upload: UploadFile) -> tuple[Path, str, int]:
     return final, digest.hexdigest(), size
 
 
-def _validate_file(path: Path) -> dict[str, Any]:
-    """Row-level checks in chunks. Counts problems per type; never prints raw rows."""
-    report: dict[str, Any] = {"rows": 0, "missing_columns": [], "errors": {}, "non_usd_rows": 0}
-    header = pd.read_csv(path, nrows=0).columns.tolist()
-    report["missing_columns"] = [c for c in REQUIRED if c not in header]
-    if report["missing_columns"]:
-        return report
-    errors = {"bad_timestamp": 0, "bad_amount": 0, "null_account": 0, "bad_label": 0}
-    for chunk in pd.read_csv(path, chunksize=250_000, dtype=str, keep_default_na=False):
-        report["rows"] += len(chunk)
-        ts = pd.to_datetime(chunk["Timestamp"], format="%Y/%m/%d %H:%M", errors="coerce")
-        errors["bad_timestamp"] += int(ts.isna().sum())
-        for col in ("Amount Received", "Amount Paid"):
-            amt = pd.to_numeric(chunk[col], errors="coerce")
-            errors["bad_amount"] += int(amt.isna().sum())
-        errors["null_account"] += int((chunk["Account"].str.strip() == "").sum())
-        errors["bad_label"] += int((~chunk["Is Laundering"].isin(["0", "1"])).sum())
-        report["non_usd_rows"] += int(
-            ((chunk["Receiving Currency"] != "US Dollar") | (chunk["Payment Currency"] != "US Dollar")).sum()
-        )
-    report["errors"] = {k: v for k, v in errors.items() if v}
-    return report
+def _get_import(db: Session, import_id: int) -> Import:
+    imp = db.get(Import, import_id)
+    if imp is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="import not found")
+    return imp
+
+
+def _file_path(imp: Import) -> Path:
+    path = UPLOAD_DIR / f"{imp.sha256}.csv"
+    if not path.exists():
+        raise HTTPException(status.HTTP_410_GONE, detail="uploaded file missing")
+    return path
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -82,7 +73,7 @@ def upload(
 ) -> dict[str, Any]:
     if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="CSV only")
-    path, digest, size = _store(file)
+    _, digest, size = _store(file)
     existing = db.execute(select(Import).where(Import.sha256 == digest)).scalar_one_or_none()
     if existing is not None:
         return {"id": existing.id, "status": existing.status, "duplicate": True, "report": existing.report}
@@ -92,26 +83,50 @@ def upload(
     return {"id": imp.id, "status": imp.status, "sha256": digest, "size_bytes": size, "duplicate": False}
 
 
-@router.post("/{import_id}/validate")
-def validate(import_id: int, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
-    imp = db.get(Import, import_id)
-    if imp is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="import not found")
-    path = UPLOAD_DIR / f"{imp.sha256}.csv"
-    if not path.exists():
-        raise HTTPException(status.HTTP_410_GONE, detail="uploaded file missing")
-    report = _validate_file(path)
-    bad = bool(report["missing_columns"]) or bool(report["errors"])
-    imp.status = "rejected" if bad else "validated"
-    imp.report = report
+@router.get("/{import_id}/columns")
+def columns(import_id: int, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
+    """The CSV's headers, the automatic mapping, and the schema fields to map."""
+    imp = _get_import(db, import_id)
+    header = read_header(_file_path(imp))
+    return {
+        "columns": header,
+        "auto_mapping": auto_map(header),
+        "schema": [{"field": f, "required": req} for f, req in SCHEMA.items()],
+    }
+
+
+@router.post("/{import_id}/sync", status_code=status.HTTP_202_ACCEPTED)
+def sync(import_id: int, body: SyncIn, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
+    imp = _get_import(db, import_id)
+    if imp.status in BUSY_STATUSES:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=f"import is {imp.status}")
+    path = _file_path(imp)
+    problems = mapping_problems(body.mapping, read_header(path))
+    if problems:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problems)
+    imp.status = "validating"
+    imp.report = {"mapping": body.mapping}
     db.commit()
-    return {"id": imp.id, "status": imp.status, "report": report}
+    start_sync(imp.id, path, body.mapping)
+    return {"id": imp.id, "status": imp.status}
+
+
+@router.post("/{import_id}/reset")
+def reset(import_id: int, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
+    """Marks a busy import as failed so it can be synced again. Only allowed when no sync thread is running for it.
+    Data already written is not rolled back; the next sync replaces all of it."""
+    imp = _get_import(db, import_id)
+    reason = can_reset(imp.status, is_live(import_id))
+    if reason is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=reason)
+    imp.status = "failed"
+    imp.report = {**(imp.report or {}), "error": "reset by admin"}
+    db.commit()
+    return {"id": imp.id, "status": imp.status}
 
 
 @router.get("/{import_id}")
 def get_import(import_id: int, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
-    imp = db.get(Import, import_id)
-    if imp is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="import not found")
+    imp = _get_import(db, import_id)
     return {"id": imp.id, "filename": imp.filename, "status": imp.status, "size_bytes": imp.size_bytes,
             "report": imp.report, "created_at": imp.created_at.isoformat()}

@@ -8,7 +8,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.models import Party, SarDraft, Transaction
+from app.db.models import Party, SarDraft, Transaction, TriageScore
 from app.orchestration.prompts import (
     SAR_SCHEMA,
     SAR_SYSTEM,
@@ -29,13 +29,40 @@ def _window(ts: datetime) -> dict[str, str]:
     return {"start": (ts - WINDOW).isoformat(), "end": (ts + WINDOW).isoformat()}
 
 
+def _model_score(db: Session, state: dict[str, Any]) -> tuple[float, list[str]] | None:
+    """XGBoost triage score for the alert's account on the alert day (plan.md section 24). None if no row."""
+    settings = get_settings()
+    day = datetime.fromisoformat(state["alert_ts"]).date()
+    row = db.execute(
+        select(TriageScore.score, TriageScore.reason_codes).where(
+            TriageScore.account_id == state["account_id"],
+            TriageScore.score_date == day,
+            TriageScore.model_version == settings.triage_model_run,
+        )
+    ).first()
+    if row is None:
+        return None
+    return float(row.score), list(row.reason_codes or [])
+
+
 def triage(db: Session, state: dict[str, Any]) -> dict[str, Any]:
-    threshold = get_settings().triage_threshold
+    settings = get_settings()
     score = float(state["risk_score"])
+    threshold = settings.triage_threshold
+    detail: dict[str, Any] = {"rule_score": score}
+    if settings.triage_model == "xgb":
+        found = _model_score(db, state)
+        if found is None:
+            detail["model_missing"] = True  # rule score used instead; recorded in the audit event
+        else:
+            score, reasons = found
+            threshold = settings.triage_score_threshold
+            detail.update(model_score=score, model_version=settings.triage_model_run, reason_codes=reasons)
     if score < threshold:
-        write_event(db, state["case_id"], "triage", "decision", {"score": score, "threshold": threshold})
+        write_event(db, state["case_id"], "triage", "decision", {"score": score, "threshold": threshold, **detail})
         return {"status": "closed_low_risk"}
-    write_event(db, state["case_id"], "triage", "opened", {"score": score, "rules": state["alert_rules"]})
+    write_event(db, state["case_id"], "triage", "opened",
+                {"score": score, "rules": state["alert_rules"], **detail})
     return {"status": "open"}
 
 

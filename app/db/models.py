@@ -1,13 +1,15 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
     UniqueConstraint,
     JSON,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -47,6 +49,19 @@ class Alert(Base):
     # "rules" (app/ingest) or "model" (app/ml). model_version is set only for model alerts.
     source: Mapped[str] = mapped_column(String(16), default="rules", server_default="rules", index=True)
     model_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class TriageScore(Base):
+    """Per account and day score from the XGBoost triage model (plan.md section 24). One set per model_version."""
+    __tablename__ = "triage_scores"
+    __table_args__ = (Index("ix_triage_scores_account_date", "account_id", "score_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64))
+    score_date: Mapped[date] = mapped_column(Date)
+    score: Mapped[float] = mapped_column(Float)
+    reason_codes: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    model_version: Mapped[str] = mapped_column(String(64), index=True)
 
 
 class Transaction(Base):
@@ -140,7 +155,8 @@ class Import(Base):
     filename: Mapped[str] = mapped_column(String(255))
     sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     size_bytes: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(32), default="uploaded")  # uploaded | validated | rejected
+    # uploaded -> validating -> rejected | loading -> triaging -> triaged | failed (see app/services/sync.py)
+    status: Mapped[str] = mapped_column(String(32), default="uploaded")
     report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
