@@ -87,6 +87,8 @@ services:
       YENTE_URL: http://yente:8000
     expose:
       - "8000"   # reached only by nginx
+    volumes:
+      - uploads:/app/data/uploads   # CSV uploads survive container recreation; a sync can be re-run from the file
     depends_on:
       postgres:
         condition: service_healthy
@@ -126,5 +128,6 @@ volumes:
   pgdata:
   esdata:
   neo4jdata:
+  uploads:
   letsencrypt:
   certbot_www:

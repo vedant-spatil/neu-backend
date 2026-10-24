@@ -23,7 +23,8 @@ RUN uv sync --frozen --no-dev
 RUN uv pip install --python /app/.venv/bin/python \
     "en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl"
 
-RUN useradd --create-home appuser
+RUN useradd --create-home appuser \
+    && mkdir -p /app/data/uploads && chown -R appuser /app/data
 USER appuser
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
