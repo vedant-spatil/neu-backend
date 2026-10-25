@@ -21,7 +21,9 @@ class Settings(BaseSettings):
 
     yente_url: str = "http://localhost:8000"
 
-    # Amazon Bedrock. Model IDs come from .env (set to a Bedrock model or inference profile ID).
+    # LLM provider for app/services/llm.py: "groq" or "bedrock". Model names (below) are IDs for that provider.
+    llm_provider: str = "groq"
+    groq_api_key: str = ""
     bedrock_api_key: str = ""
     bedrock_region: str = "ap-south-1"
     llm_model_heavy: str = ""
