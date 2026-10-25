@@ -1,6 +1,6 @@
-"""Sync an uploaded CSV (ETL stages 3 and 4): validate it with the saved column mapping, load it through the ingest
-path, then open cases for the highest-risk new alerts. Runs in a background thread. Progress is written to
-imports.status and imports.report, which the frontend polls.
+"""Sync an uploaded CSV: validate it with the saved column mapping, then load it through the ingest path. Runs in a
+background thread. Progress is written to imports.status and imports.report, which the frontend polls. The sync opens
+no cases: a case starts only when an investigator opens it from the alert queue (each case runs the LLM workflow).
 
 Replace semantics, as in app.ingest.load: transactions, parties and the account graph are replaced on every sync.
 Rule alerts that already have cases are kept, and so are model alerts.
@@ -16,8 +16,7 @@ from pathlib import Path
 
 from sqlalchemy import select, text
 
-from app.config import get_settings
-from app.db.models import Alert, Case, Import
+from app.db.models import Import
 from app.db.session import SessionLocal
 from app.ingest.load import (
     _batches,
@@ -28,7 +27,6 @@ from app.ingest.load import (
     build_parties,
 )
 from app.ingest.mapping import load_mapped, validate_mapped
-from app.services import cases as case_service
 from app.services.graph_store import driver
 
 log = logging.getLogger(__name__)
@@ -114,9 +112,9 @@ def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
         _replace_parties(accounts)
         _progress(import_id, "loading", stage="graph")
         _replace_graph(df, accounts)
-        _progress(import_id, "triaging", stage="cases")
-        opened = _open_cases()
-        _progress(import_id, "triaged", stage="done", cases_opened=opened)
+        # No cases are opened here. Each case runs the LLM workflow, so a case starts only when an investigator opens
+        # it from the alert queue.
+        _progress(import_id, "triaged", stage="done", cases_opened=0)
     except Exception as exc:
         log.exception("sync %s failed", import_id)
         _progress(import_id, "failed", error=str(exc)[:500])
@@ -157,24 +155,3 @@ def _replace_graph(df, accounts: list[str]) -> None:
     _load_neo4j(df, accounts)
 
 
-def _open_cases() -> int:
-    """Opens a case for each new rule alert at or above the triage threshold, highest risk first, up to the cap.
-    Each case runs the graph in turn (the LLM steps are rate limited, so the cases run one at a time)."""
-    settings = get_settings()
-    with SessionLocal() as db:
-        alerts = db.execute(
-            select(Alert)
-            .where(Alert.source == "rules", Alert.risk_score >= settings.triage_threshold,
-                   Alert.id.not_in(select(Case.alert_id)))
-            .order_by(Alert.risk_score.desc(), Alert.id)
-            .limit(settings.sync_max_cases)
-        ).scalars().all()
-        queued = [
-            (a.id, a.account_id, a.ts.isoformat(), list(a.rules or []), a.risk_score,
-             [int(i) for i in (a.raw_json or {}).get("txn_ids", [])])
-            for a in alerts
-        ]
-        case_ids = [case_service.start_case(db, a).id for a in alerts]
-    for case_id, (alert_id, account_id, ts, rules, risk, txn_ids) in zip(case_ids, queued):
-        case_service.run_case(case_id, alert_id, account_id, ts, rules, risk, txn_ids)
-    return len(case_ids)

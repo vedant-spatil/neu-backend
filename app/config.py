@@ -41,8 +41,6 @@ class Settings(BaseSettings):
     triage_model: str = "rules"
     triage_model_run: str = ""
     triage_score_threshold: float = 0.6
-    # Most cases one sync opens (highest risk first). Each case runs the LLM graph, so this caps cost and rate limits.
-    sync_max_cases: int = 50
 
     # Paths default to the current locations under BACKEND_ROOT. Override with env vars.
     # Planned move (plan.md section 22): data -> backend/data, checkpoints -> backend/artifacts/models.
