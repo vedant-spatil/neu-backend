@@ -1,21 +1,30 @@
-from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Response,
+    status,
+)
 from pydantic import BaseModel, Field
-from sqlalchemy import Date, Text, cast, func, select, text
+from sqlalchemy import Text, cast, func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
-from app.config import get_settings
-from app.db.models import Alert, Case, CaseEvent, Decision, SarDraft, Transaction, User
+from app.api.deps import current_user, db_session, require_role
+from app.db.models import Alert, Case, CaseEvent, SarDraft, Transaction, User
 from app.services import cases as case_service
+from app.services.access import case_scope, get_visible_case
+from app.services.audit import write_event
+from app.services.cache import get_or_compute, invalidate
+from app.services.dashboard import dashboard_payload, trends_payload
+from app.services.notify import notify, notify_admins
 
 router = APIRouter(prefix="/api", tags=["cases"])
 
-
-def _threshold() -> float:
-    return get_settings().triage_threshold
+_admin = require_role("admin")
 
 
 class AlertOut(BaseModel):
@@ -32,6 +41,11 @@ class CaseOut(BaseModel):
     alert_id: int
     status: str
     risk_score: float
+    assignee_id: int | None = None
+
+
+def _case_out(c: Case) -> CaseOut:
+    return CaseOut(id=c.id, alert_id=c.alert_id, status=c.status, risk_score=c.risk_score, assignee_id=c.assignee_id)
 
 
 class DecisionIn(BaseModel):
@@ -41,6 +55,10 @@ class DecisionIn(BaseModel):
     reviewed: bool
 
     model_config = {"extra": "forbid"}
+
+
+class AssignIn(BaseModel):
+    user_id: int
 
 
 class AlertPage(BaseModel):
@@ -68,19 +86,17 @@ def list_alerts(
     rule: str | None = Query(None, max_length=64),
     account: str | None = Query(None, max_length=64, description="account id prefix"),
     sort: str = Query("score_desc", pattern="^(score_desc|score_asc|ts_desc|ts_asc|amount_desc)$"),
-    _: User = Depends(current_user),
+    _: User = Depends(_admin),
     db: Session = Depends(db_session),
 ) -> AlertPage:
-    """Paginated alert queue. One row per (account, rule). Default order: highest score first."""
+    """Paginated alert queue (admin only). One row per (account, rule). Default order: highest score first."""
     q = select(Alert).where(Alert.risk_score >= min_score)
     if rule:
         q = q.where(cast(Alert.rules, Text).like(f'%"{rule}"%'))
     if account:
         q = q.where(Alert.account_id.startswith(account, autoescape=True))
     total = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
-    rows = db.execute(
-        q.order_by(*ALERT_SORTS[sort]).offset(offset).limit(limit)
-    ).scalars()
+    rows = db.execute(q.order_by(*ALERT_SORTS[sort]).offset(offset).limit(limit)).scalars()
     items = [
         AlertOut(id=a.id, account_id=a.account_id, amount=float(a.amount), ts=a.ts.isoformat(),
                  risk_score=a.risk_score, rules=a.rules or [])
@@ -90,109 +106,46 @@ def list_alerts(
 
 
 @router.get("/dashboard")
-def dashboard(_: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, Any]:
-    """Aggregates for the home screen. Each query is one indexed or grouped scan."""
-    case_status = dict(db.execute(select(Case.status, func.count()).group_by(Case.status)).all())
-    alert_rules = {}
-    for (rules,) in db.execute(select(Alert.rules).where(Alert.risk_score >= _threshold())).all():
-        for r in rules or []:
-            alert_rules[r] = alert_rules.get(r, 0) + 1
-    top_accounts = [
-        {"account_id": a, "alerts": n}
-        for a, n in db.execute(
-            select(Alert.account_id, func.count()).where(Alert.risk_score >= _threshold())
-            .group_by(Alert.account_id).order_by(func.count().desc()).limit(10)
-        ).all()
-    ]
-    buckets = dict(
-        db.execute(
-            select(func.floor(Alert.risk_score * 10), func.count()).group_by(text("1"))
-        ).all()
-    )
-    decisions_by_action = dict(
-        db.execute(select(Decision.action, func.count()).group_by(Decision.action)).all()
-    )
-    return {
-        "cases_by_status": case_status,
-        "decisions_by_action": decisions_by_action,
-        "alerts_above_threshold_by_rule": alert_rules,
-        "top_accounts_by_alerts": top_accounts,
-        "score_histogram": {f"{int(k) / 10:.1f}": v for k, v in buckets.items()},
-        "failed_cases": case_status.get("failed", 0),
-    }
-
-
-def merge_activity(cases: list[tuple[date, int]], decisions: list[tuple[date, str, int]]) -> list[dict[str, Any]]:
-    """One row per day: cases opened, and decisions split into approved and closed. Days are sorted oldest first."""
-    rows: dict[date, dict[str, Any]] = {}
-
-    def row(day: date) -> dict[str, Any]:
-        return rows.setdefault(day, {"cases_opened": 0, "approved": 0, "closed": 0})
-
-    for day, n in cases:
-        row(day)["cases_opened"] += n
-    for day, action, n in decisions:
-        row(day)["approved" if action == "approve" else "closed"] += n
-    return [{"day": day.isoformat(), **values} for day, values in sorted(rows.items())]
+def dashboard(user: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, Any]:
+    """Aggregates for the home screen. Admin sees the totals; QA sees their assigned cases only. Cached until the
+    next change (services/cache.py)."""
+    return get_or_compute(f"dashboard:{user.role}:{user.id}", lambda: dashboard_payload(db, user))
 
 
 @router.get("/dashboard/trends")
 def dashboard_trends(
     days: int = Query(30, ge=1, le=365),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> dict[str, Any]:
-    """Daily series for the dashboard charts.
-
-    alerts_by_day groups alerts by the day of their transactions (alerts.ts, the data's clock), counting the last
-    `days` days of alerts. activity_by_day groups cases and decisions by when they were created (the app's clock),
-    over the last `days` days."""
-    threshold = _threshold()
-    alert_day = cast(Alert.ts, Date)
-    last = db.execute(select(func.max(alert_day)).where(Alert.risk_score >= threshold)).scalar()
-    alerts: list[tuple[date, int]] = []
-    if last is not None:
-        start = last - timedelta(days=days - 1)
-        alerts = [
-            (d, n) for d, n in db.execute(
-                select(alert_day, func.count())
-                .where(Alert.risk_score >= threshold, alert_day >= start)
-                .group_by(alert_day).order_by(alert_day)
-            ).all()
-        ]
-    since = datetime.now(UTC) - timedelta(days=days)
-    case_day = cast(Case.created_at, Date)
-    decision_day = cast(Decision.created_at, Date)
-    cases = db.execute(
-        select(case_day, func.count()).where(Case.created_at >= since).group_by(case_day)
-    ).all()
-    decisions = db.execute(
-        select(decision_day, Decision.action, func.count())
-        .where(Decision.created_at >= since).group_by(decision_day, Decision.action)
-    ).all()
-    return {
-        "alerts_by_day": [{"day": d.isoformat(), "alerts": n} for d, n in alerts],
-        "activity_by_day": merge_activity(list(cases), list(decisions)),
-    }
+    """Daily series for the dashboard charts (see services/dashboard.py)."""
+    return get_or_compute(f"trends:{user.role}:{user.id}:{days}", lambda: trends_payload(db, user, days))
 
 
 @router.post("/alerts/{alert_id}/cases", response_model=CaseOut, status_code=status.HTTP_202_ACCEPTED)
 def open_case(
     alert_id: int,
     background: BackgroundTasks,
-    _: User = Depends(current_user),
+    response: Response,
+    _: User = Depends(_admin),
     db: Session = Depends(db_session),
 ) -> CaseOut:
+    """Opens a case for an alert (admin only). An alert has one case: if it already has one, that case is returned
+    (200) and nothing new starts. Otherwise a case is created and its workflow runs in the background (202)."""
     alert = db.get(Alert, alert_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="alert not found")
+    existing = db.execute(select(Case).where(Case.alert_id == alert_id).order_by(Case.id.desc())).scalars().first()
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        return _case_out(existing)
     case = case_service.start_case(db, alert)
     txn_ids = [int(i) for i in (alert.raw_json or {}).get("txn_ids", [])]
     background.add_task(
         case_service.run_case, case.id, alert.id, alert.account_id, alert.ts.isoformat(),
         list(alert.rules or []), alert.risk_score, txn_ids,
     )
-    return CaseOut(id=case.id, alert_id=alert.id, status=case.status, risk_score=case.risk_score)
+    return _case_out(case)
 
 
 class CasePage(BaseModel):
@@ -207,29 +160,29 @@ def list_cases(
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status", max_length=32),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> CasePage:
-    """Paginated case list, newest first. Optional status filter (open, awaiting_review, approved, closed, failed, superseded)."""
+    """Paginated case list, newest first. QA sees only the cases assigned to them. Optional status filter."""
     q = select(Case)
+    scope = case_scope(user)
+    if scope is not None:
+        q = q.where(scope)
     if status_filter:
         q = q.where(Case.status == status_filter)
     total = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
     rows = db.execute(q.order_by(Case.id.desc()).offset(offset).limit(limit)).scalars()
-    items = [CaseOut(id=c.id, alert_id=c.alert_id, status=c.status, risk_score=c.risk_score) for c in rows]
-    return CasePage(total=total, offset=offset, limit=limit, items=items)
+    return CasePage(total=total, offset=offset, limit=limit, items=[_case_out(c) for c in rows])
 
 
 @router.get("/cases/{case_id}", response_model=CaseOut)
-def get_case(case_id: int, _: User = Depends(current_user), db: Session = Depends(db_session)) -> CaseOut:
-    case = db.get(Case, case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="case not found")
-    return CaseOut(id=case.id, alert_id=case.alert_id, status=case.status, risk_score=case.risk_score)
+def get_case(case_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)) -> CaseOut:
+    return _case_out(get_visible_case(db, user, case_id))
 
 
 @router.get("/cases/{case_id}/events")
-def case_events(case_id: int, _: User = Depends(current_user), db: Session = Depends(db_session)) -> list[dict[str, Any]]:
+def case_events(case_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)) -> list[dict[str, Any]]:
+    get_visible_case(db, user, case_id)
     rows = db.execute(select(CaseEvent).where(CaseEvent.case_id == case_id).order_by(CaseEvent.id)).scalars()
     return [
         {"node": e.node, "kind": e.kind, "payload": e.payload_json, "created_at": e.created_at.isoformat()}
@@ -238,7 +191,8 @@ def case_events(case_id: int, _: User = Depends(current_user), db: Session = Dep
 
 
 @router.get("/cases/{case_id}/sar")
-def get_sar(case_id: int, _: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, Any]:
+def get_sar(case_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, Any]:
+    get_visible_case(db, user, case_id)
     sar = db.execute(
         select(SarDraft).where(SarDraft.case_id == case_id).order_by(SarDraft.version.desc())
     ).scalars().first()
@@ -251,14 +205,12 @@ def get_sar(case_id: int, _: User = Depends(current_user), db: Session = Depends
 def case_graph(
     case_id: int,
     max_edges: int = Query(50, ge=1, le=200),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> dict[str, Any]:
     """Cytoscape elements for the case account. Parallel transfers between the same pair are
     merged into one edge (count, total). Only the top `max_edges` pairs by total are returned."""
-    case = db.get(Case, case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="case not found")
+    case = get_visible_case(db, user, case_id)
     alert = db.get(Alert, case.alert_id)
     txn_ids = [int(i) for i in (alert.raw_json or {}).get("txn_ids", [])]
     rows = db.execute(select(Transaction).where(Transaction.id.in_(txn_ids))).scalars() if txn_ids else []
@@ -291,9 +243,7 @@ def decide(
     user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> CaseOut:
-    case = db.get(Case, case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="case not found")
+    case = get_visible_case(db, user, case_id)
     if case.status != "awaiting_review":
         raise HTTPException(status_code=409, detail=f"case is {case.status}, not awaiting_review")
     if not body.reviewed:
@@ -303,5 +253,56 @@ def decide(
         {"action": body.action, "reason": body.reason, "typologies": body.typologies, "actor_user_id": user.id},
     )
     db.refresh(case)
-    return CaseOut(id=case.id, alert_id=case.alert_id, status=case.status, risk_score=case.risk_score)
+    if user.role == "qa":
+        notify_admins(db, "review_completed", f"A reviewer completed a review of case {case.id}.",
+                      link=f"/cases/{case.id}")
+    return _case_out(case)
 
+
+@router.post("/cases/{case_id}/assign", response_model=CaseOut)
+def assign_case(
+    case_id: int,
+    body: AssignIn,
+    _: User = Depends(_admin),
+    db: Session = Depends(db_session),
+) -> CaseOut:
+    """Assigns a case to a QA user (admin only). The QA user gets a notification and sees the case."""
+    case = db.get(Case, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    target = db.get(User, body.user_id)
+    if target is None or target.role != "qa" or not target.is_active:
+        raise HTTPException(status_code=422, detail="assignee must be an active QA user")
+    case.assignee_id = target.id
+    db.commit()
+    write_event(db, case.id, "assignment", "assigned", {"user_id": target.id})
+    notify(db, target.id, "case_assigned", f"Case {case.id} was assigned to you.", link=f"/cases/{case.id}")
+    return _case_out(case)
+
+
+@router.post("/cases/{case_id}/rerun", response_model=CaseOut, status_code=status.HTTP_202_ACCEPTED)
+def rerun_case(
+    case_id: int,
+    background: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: Session = Depends(db_session),
+) -> CaseOut:
+    """Reruns the workflow of a failed case, on a new LangGraph thread. The events of the failed run are kept."""
+    case = get_visible_case(db, user, case_id)
+    if case.status != "failed":
+        raise HTTPException(status_code=409, detail=f"case is {case.status}; only failed cases can be rerun")
+    alert = db.get(Alert, case.alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="alert not found")
+    attempt = int((case.state or {}).get("attempt", 0)) + 1
+    case.state = {**(case.state or {}), "attempt": attempt}
+    case.status = "open"
+    db.commit()
+    write_event(db, case.id, "workflow", "rerun", {"attempt": attempt, "by_user_id": user.id})
+    invalidate()
+    txn_ids = [int(i) for i in (alert.raw_json or {}).get("txn_ids", [])]
+    background.add_task(
+        case_service.run_case, case.id, alert.id, alert.account_id, alert.ts.isoformat(),
+        list(alert.rules or []), alert.risk_score, txn_ids, attempt,
+    )
+    return _case_out(case)

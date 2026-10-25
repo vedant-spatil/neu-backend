@@ -1,6 +1,6 @@
 from datetime import date
 
-from app.api.routers.cases import merge_activity
+from app.services.dashboard import merge_activity
 
 
 def test_empty_inputs_give_no_days():
