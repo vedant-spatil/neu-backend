@@ -1,7 +1,7 @@
 """Background assessment of one assigned account (plan Part A).
 
 Runs the full case workflow for the account's highest-scored alert, then writes tags for QA.
-Worker runs with --concurrency=1 to stay within the Bedrock throughput quota for the model.
+Worker runs with --concurrency=1 to stay within the Groq rate limit for the model.
 
 Disabled: the Celery task evaluate_account is commented out below, with its imports. The tag
 helpers stay active because the QA tag check uses them."""
