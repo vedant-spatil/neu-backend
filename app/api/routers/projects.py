@@ -9,7 +9,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session, require_role
-from app.db.models import Evaluation, Project, ProjectAccount, ProjectMember, User
+from app.db.models import (
+    Alert,
+    Case,
+    Evaluation,
+    Project,
+    ProjectAccount,
+    ProjectMember,
+    User,
+)
+from app.services.audit import write_event
 from app.tasks.assess import ALLOWED_TAGS, is_allowed_tag
 
 # Disabled: the auto-validate feature (auto_validate flag, auto drafts from the Celery worker,
@@ -120,6 +129,50 @@ def add_accounts(project_id: int, body: AccountsIn, _: User = Depends(_admin),
             added.append(acct)
             # Disabled: auto layer queued evaluate_account.delay(project_id, acct) here.
     return {"added": added}
+
+
+def split_accounts(accounts: list[str], existing: set[str]) -> tuple[list[str], list[str]]:
+    """Accounts to add (not yet in the project, first occurrence order) and accounts already present."""
+    unique = list(dict.fromkeys(accounts))
+    return [a for a in unique if a not in existing], [a for a in unique if a in existing]
+
+
+class CasesToProjectIn(BaseModel):
+    case_ids: list[int] = Field(min_length=1, max_length=500)
+    project_id: int | None = None
+    project_name: str | None = Field(None, min_length=3, max_length=120)
+
+
+@router.post("/api/projects/accounts-from-cases", status_code=status.HTTP_201_CREATED)
+def accounts_from_cases(body: CasesToProjectIn, admin: User = Depends(_admin),
+                        db: Session = Depends(db_session)) -> dict[str, Any]:
+    """Adds the accounts of the selected cases to a project. Give either an existing project_id or a new project_name.
+    Each case gets one audit event."""
+    if (body.project_id is None) == (body.project_name is None):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="give either project_id or project_name")
+    if body.project_name is not None:
+        project = Project(name=body.project_name, created_by=admin.id)
+        db.add(project)
+        db.commit()
+    else:
+        project = _project(db, body.project_id)
+
+    rows = db.execute(
+        select(Case.id, Alert.account_id).join(Alert, Alert.id == Case.alert_id).where(Case.id.in_(body.case_ids))
+    ).all()
+    missing = sorted(set(body.case_ids) - {case_id for case_id, _ in rows})
+    accounts = [account for _, account in rows]
+    existing = set(db.execute(
+        select(ProjectAccount.account_id).where(ProjectAccount.project_id == project.id)
+    ).scalars())
+    to_add, already = split_accounts(accounts, existing)
+    for account in to_add:
+        db.add(ProjectAccount(project_id=project.id, account_id=account))
+    db.commit()
+    for case_id, account in rows:
+        write_event(db, case_id, "projects", "added_to_project", {"project_id": project.id, "account_id": account})
+    return {"project_id": project.id, "project_name": project.name, "added": to_add,
+            "already_present": already, "missing_case_ids": missing}
 
 
 @router.get("/api/projects")
