@@ -11,7 +11,7 @@ docs
 data
 models
 artifacts
-pipeline
+/pipeline
 tests
 graphify-out
 plan.md
