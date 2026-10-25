@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from neo4j import GraphDatabase, Driver
+from neo4j import Driver, GraphDatabase
 
 from app.config import get_settings
 

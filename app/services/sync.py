@@ -28,7 +28,11 @@ from app.ingest.load import (
     build_parties,
 )
 from app.ingest.mapping import load_mapped, validate_mapped
+from app.services.cache import invalidate
 from app.services.graph_store import driver
+from app.services.notify import notify
+
+TERMINAL_STATUSES = {"triaged", "rejected", "failed"}
 
 log = logging.getLogger(__name__)
 PLANTED_NAMES = 2000  # same default as the loader's --limit-plant
@@ -93,6 +97,13 @@ def _progress(import_id: int, status: str, **fields) -> None:
                       "elapsed_s": round(elapsed, 1), "process_peak_rss_mb": round(peak_mb)}
         db.commit()
     log.info("sync %s %s elapsed=%.0fs peak_rss=%.0fMB", import_id, status, elapsed, peak_mb)
+    if status in TERMINAL_STATUSES:
+        # The admin who uploaded the file hears how it ended. notify() also invalidates the cache.
+        with SessionLocal() as db:
+            imp = db.get(Import, import_id)
+            notify(db, imp.uploaded_by, "import_result", f"Import {import_id} finished: {status}.", link="/import")
+    else:
+        invalidate()
 
 
 def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
@@ -124,7 +135,7 @@ def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
 def _replace_parties(accounts: list[str]) -> None:
     try:
         planted = _planted_names(PLANTED_NAMES)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("OpenSanctions names unavailable; parties are loaded without planted sanctions hits")
         planted = []
     parties = build_parties(accounts, planted)

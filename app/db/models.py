@@ -103,6 +103,22 @@ class Case(Base):
     state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The QA user this case is assigned to. Admins see every case; QA sees only their own (services/access.py).
+    assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+
+
+class Notification(Base):
+    """In-app notification for one user. Messages are generic and carry no case content."""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    message: Mapped[str] = mapped_column(String(300))
+    link: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CaseEvent(Base):

@@ -19,6 +19,7 @@ from app.db.models import (
     User,
 )
 from app.services.audit import write_events
+from app.services.notify import notify, notify_admins
 from app.tasks.assess import ALLOWED_TAGS, is_allowed_tag
 
 # Disabled: the auto-validate feature (auto_validate flag, auto drafts from the Celery worker,
@@ -112,6 +113,7 @@ def add_member(project_id: int, body: MemberIn, _: User = Depends(_admin), db: S
     if not _is_member(db, project_id, u.id):
         db.add(ProjectMember(project_id=project_id, user_id=u.id))
         db.commit()
+        notify(db, u.id, "project_member_added", "You were added to a project.", link="/qa/projects")
     return {"project_id": project_id, "user_id": u.id}
 
 
@@ -263,6 +265,8 @@ def qa_manual_evaluation(project_id: int, account_id: str, body: TagsIn, qa: Use
                    status="submitted", tags=_check_tags(body.tags), notes=body.notes)
     db.add(e)
     db.commit()
+    notify_admins(db, "review_completed", "A reviewer submitted an account evaluation.",
+                  link=f"/admin/projects/{project_id}")
     return _eval_out(e)
 
 
@@ -290,6 +294,8 @@ def qa_resubmit(evaluation_id: int, body: TagsIn, qa: User = Depends(_qa), db: S
         raise HTTPException(status.HTTP_409_CONFLICT, detail=f"evaluation is {e.status}, not rejected")
     e.tags, e.notes, e.status, e.reject_reason = _check_tags(body.tags), body.notes, "submitted", None
     db.commit()
+    notify_admins(db, "review_completed", "A reviewer resubmitted an account evaluation.",
+                  link=f"/admin/projects/{e.project_id}")
     return _eval_out(e)
 
 
