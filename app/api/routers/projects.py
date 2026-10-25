@@ -18,7 +18,7 @@ from app.db.models import (
     ProjectMember,
     User,
 )
-from app.services.audit import write_event
+from app.services.audit import write_events
 from app.tasks.assess import ALLOWED_TAGS, is_allowed_tag
 
 # Disabled: the auto-validate feature (auto_validate flag, auto drafts from the Celery worker,
@@ -119,16 +119,14 @@ def add_member(project_id: int, body: MemberIn, _: User = Depends(_admin), db: S
 def add_accounts(project_id: int, body: AccountsIn, _: User = Depends(_admin),
                  db: Session = Depends(db_session)) -> dict[str, Any]:
     _project(db, project_id)
-    added: list[str] = []
-    for acct in dict.fromkeys(body.account_ids):
-        exists = db.execute(select(ProjectAccount).where(
-            ProjectAccount.project_id == project_id, ProjectAccount.account_id == acct)).scalar_one_or_none()
-        if exists is None:
-            db.add(ProjectAccount(project_id=project_id, account_id=acct))
-            db.commit()
-            added.append(acct)
-            # Disabled: auto layer queued evaluate_account.delay(project_id, acct) here.
-    return {"added": added}
+    # One query for the accounts already in the project, then one insert and one commit.
+    existing = set(db.execute(
+        select(ProjectAccount.account_id).where(ProjectAccount.project_id == project_id)
+    ).scalars())
+    to_add, _ = split_accounts(body.account_ids, existing)
+    db.add_all(ProjectAccount(project_id=project_id, account_id=acct) for acct in to_add)
+    db.commit()
+    return {"added": to_add}
 
 
 def split_accounts(accounts: list[str], existing: set[str]) -> tuple[list[str], list[str]]:
@@ -169,8 +167,8 @@ def accounts_from_cases(body: CasesToProjectIn, admin: User = Depends(_admin),
     for account in to_add:
         db.add(ProjectAccount(project_id=project.id, account_id=account))
     db.commit()
-    for case_id, account in rows:
-        write_event(db, case_id, "projects", "added_to_project", {"project_id": project.id, "account_id": account})
+    write_events(db, [(case_id, "projects", "added_to_project", {"project_id": project.id, "account_id": account})
+                      for case_id, account in rows])
     return {"project_id": project.id, "project_name": project.name, "added": to_add,
             "already_present": already, "missing_case_ids": missing}
 

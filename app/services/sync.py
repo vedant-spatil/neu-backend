@@ -14,9 +14,10 @@ import threading
 import time
 from pathlib import Path
 
+import pandas as pd
 from sqlalchemy import select, text
 
-from app.db.models import Import
+from app.db.models import Alert, Import
 from app.db.session import SessionLocal
 from app.ingest.load import (
     _batches,
@@ -111,10 +112,10 @@ def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
         _progress(import_id, "loading", stage="parties", accounts=len(accounts))
         _replace_parties(accounts)
         _progress(import_id, "loading", stage="graph")
-        _replace_graph(df, accounts)
+        graph_edges = _replace_graph(df)
         # No cases are opened here. Each case runs the LLM workflow, so a case starts only when an investigator opens
         # it from the alert queue.
-        _progress(import_id, "triaged", stage="done", cases_opened=0)
+        _progress(import_id, "triaged", stage="done", cases_opened=0, graph_edges=graph_edges)
     except Exception as exc:
         log.exception("sync %s failed", import_id)
         _progress(import_id, "failed", error=str(exc)[:500])
@@ -150,8 +151,32 @@ def _clear_graph() -> None:
             pass
 
 
-def _replace_graph(df, accounts: list[str]) -> None:
+def two_hop_slice(df: pd.DataFrame, flagged: set[str]) -> tuple[pd.DataFrame, list[str]]:
+    """Transfers whose two ends both lie within two hops of a flagged account, and the accounts they touch.
+
+    Two hops keeps what the flow tracer reads: fan-out and fan-in use a flagged account's own transfers, and a cycle
+    of up to four accounts through it uses only accounts within two hops. Transfers further out are not loaded."""
+    if not flagged:
+        return df.iloc[0:0], []
+    src, dst = df["from_account"], df["to_account"]
+
+    def neighbours(nodes: set[str]) -> set[str]:
+        return set(dst[src.isin(nodes)]) | set(src[dst.isin(nodes)])
+
+    one_hop = set(flagged) | neighbours(set(flagged))
+    two_hop = one_hop | neighbours(one_hop)
+    edges = df[src.isin(two_hop) & dst.isin(two_hop)]
+    nodes = sorted(set(edges["from_account"]).union(edges["to_account"]))
+    return edges, nodes
+
+
+def _replace_graph(df: pd.DataFrame) -> int:
+    """Loads the transfers within two hops of rule-alert accounts into Neo4j. Returns the number of edges loaded."""
+    with SessionLocal() as db:
+        flagged = set(db.execute(select(Alert.account_id).where(Alert.source == "rules").distinct()).scalars())
+    edges, nodes = two_hop_slice(df, flagged)
     _clear_graph()
-    _load_neo4j(df, accounts)
+    _load_neo4j(edges, nodes)
+    return len(edges)
 
 
