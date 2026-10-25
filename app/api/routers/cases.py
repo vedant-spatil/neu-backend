@@ -1,8 +1,9 @@
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import Text, cast, func, select, text
+from sqlalchemy import Date, Text, cast, func, select, text
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session
@@ -49,22 +50,36 @@ class AlertPage(BaseModel):
     items: list[AlertOut]
 
 
+# Sort orders for the alert queue. The id tie-break keeps pages stable.
+ALERT_SORTS = {
+    "score_desc": (Alert.risk_score.desc(), Alert.id),
+    "score_asc": (Alert.risk_score.asc(), Alert.id),
+    "ts_desc": (Alert.ts.desc(), Alert.id),
+    "ts_asc": (Alert.ts.asc(), Alert.id),
+    "amount_desc": (Alert.amount.desc(), Alert.id),
+}
+
+
 @router.get("/alerts", response_model=AlertPage)
 def list_alerts(
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=200),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     rule: str | None = Query(None, max_length=64),
+    account: str | None = Query(None, max_length=64, description="account id prefix"),
+    sort: str = Query("score_desc", pattern="^(score_desc|score_asc|ts_desc|ts_asc|amount_desc)$"),
     _: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> AlertPage:
-    """Paginated alert queue. One row per (account, rule), highest score first."""
+    """Paginated alert queue. One row per (account, rule). Default order: highest score first."""
     q = select(Alert).where(Alert.risk_score >= min_score)
     if rule:
         q = q.where(cast(Alert.rules, Text).like(f'%"{rule}"%'))
+    if account:
+        q = q.where(Alert.account_id.startswith(account, autoescape=True))
     total = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
     rows = db.execute(
-        q.order_by(Alert.risk_score.desc(), Alert.id).offset(offset).limit(limit)
+        q.order_by(*ALERT_SORTS[sort]).offset(offset).limit(limit)
     ).scalars()
     items = [
         AlertOut(id=a.id, account_id=a.account_id, amount=float(a.amount), ts=a.ts.isoformat(),
@@ -104,6 +119,60 @@ def dashboard(_: User = Depends(current_user), db: Session = Depends(db_session)
         "top_accounts_by_alerts": top_accounts,
         "score_histogram": {f"{int(k) / 10:.1f}": v for k, v in buckets.items()},
         "failed_cases": case_status.get("failed", 0),
+    }
+
+
+def merge_activity(cases: list[tuple[date, int]], decisions: list[tuple[date, str, int]]) -> list[dict[str, Any]]:
+    """One row per day: cases opened, and decisions split into approved and closed. Days are sorted oldest first."""
+    rows: dict[date, dict[str, Any]] = {}
+
+    def row(day: date) -> dict[str, Any]:
+        return rows.setdefault(day, {"cases_opened": 0, "approved": 0, "closed": 0})
+
+    for day, n in cases:
+        row(day)["cases_opened"] += n
+    for day, action, n in decisions:
+        row(day)["approved" if action == "approve" else "closed"] += n
+    return [{"day": day.isoformat(), **values} for day, values in sorted(rows.items())]
+
+
+@router.get("/dashboard/trends")
+def dashboard_trends(
+    days: int = Query(30, ge=1, le=365),
+    _: User = Depends(current_user),
+    db: Session = Depends(db_session),
+) -> dict[str, Any]:
+    """Daily series for the dashboard charts.
+
+    alerts_by_day groups alerts by the day of their transactions (alerts.ts, the data's clock), counting the last
+    `days` days of alerts. activity_by_day groups cases and decisions by when they were created (the app's clock),
+    over the last `days` days."""
+    threshold = _threshold()
+    alert_day = cast(Alert.ts, Date)
+    last = db.execute(select(func.max(alert_day)).where(Alert.risk_score >= threshold)).scalar()
+    alerts: list[tuple[date, int]] = []
+    if last is not None:
+        start = last - timedelta(days=days - 1)
+        alerts = [
+            (d, n) for d, n in db.execute(
+                select(alert_day, func.count())
+                .where(Alert.risk_score >= threshold, alert_day >= start)
+                .group_by(alert_day).order_by(alert_day)
+            ).all()
+        ]
+    since = datetime.now(UTC) - timedelta(days=days)
+    case_day = cast(Case.created_at, Date)
+    decision_day = cast(Decision.created_at, Date)
+    cases = db.execute(
+        select(case_day, func.count()).where(Case.created_at >= since).group_by(case_day)
+    ).all()
+    decisions = db.execute(
+        select(decision_day, Decision.action, func.count())
+        .where(Decision.created_at >= since).group_by(decision_day, Decision.action)
+    ).all()
+    return {
+        "alerts_by_day": [{"day": d.isoformat(), "alerts": n} for d, n in alerts],
+        "activity_by_day": merge_activity(list(cases), list(decisions)),
     }
 
 
