@@ -13,7 +13,7 @@ docs/
 third_party/
 artifacts/
 external/
-pipeline/
+/pipeline/
 mainvenv/
 
 # Model checkpoints and tool caches: not source, never pushed
