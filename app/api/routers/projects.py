@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session, require_role
@@ -180,7 +180,19 @@ def list_projects(user: User = Depends(require_role("admin", "qa")), db: Session
     q = select(Project).order_by(Project.id.desc())
     if user.role == "qa":
         q = q.join(ProjectMember, ProjectMember.project_id == Project.id).where(ProjectMember.user_id == user.id)
-    return [{"id": p.id, "name": p.name} for p in db.execute(q).scalars()]
+    projects = list(db.execute(q).scalars())
+    # Two grouped counts for the whole list, not one query per project.
+    ids = [p.id for p in projects]
+    members = dict(db.execute(
+        select(ProjectMember.project_id, func.count()).where(ProjectMember.project_id.in_(ids))
+        .group_by(ProjectMember.project_id)
+    ).all()) if ids else {}
+    accounts = dict(db.execute(
+        select(ProjectAccount.project_id, func.count()).where(ProjectAccount.project_id.in_(ids))
+        .group_by(ProjectAccount.project_id)
+    ).all()) if ids else {}
+    return [{"id": p.id, "name": p.name, "members": members.get(p.id, 0), "accounts": accounts.get(p.id, 0)}
+            for p in projects]
 
 
 @router.get("/api/projects/{project_id}")

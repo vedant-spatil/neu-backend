@@ -63,6 +63,35 @@ def signup(body: SignupIn, request: Request, db: Session = Depends(db_session)) 
     return TokenResponse(access_token=create_access_token(user.id, user.role))
 
 
+def password_change_error(current_matches: bool, current: str, new: str) -> str | None:
+    """The first problem with a password change, or None. Mirrors the sign-up rule for the new password."""
+    if not current_matches:
+        return "the current password is wrong"
+    if len(new) < 10:
+        return "use at least 10 characters for the new password"
+    if new == current:
+        return "the new password must differ from the current one"
+    return None
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=10, max_length=256)
+
+
+@router.post("/change-password")
+def change_password(body: ChangePasswordIn, user: User = Depends(current_user),
+                    db: Session = Depends(db_session)) -> dict[str, str]:
+    """Changes the signed-in user's password. The password itself is never returned or logged: only its hash is kept."""
+    problem = password_change_error(verify_password(body.current_password, user.password_hash),
+                                    body.current_password, body.new_password)
+    if problem is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    return {"status": "changed"}
+
+
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user)) -> UserOut:
     return UserOut(id=user.id, email=user.email, role=user.role)
