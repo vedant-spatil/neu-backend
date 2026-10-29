@@ -26,14 +26,18 @@ def _unread(db: Session, user_id: int) -> int:
 
 
 @router.get("")
-def list_notifications(limit: int = Query(20, ge=1, le=100), user: User = Depends(current_user),
-                       db: Session = Depends(db_session)) -> dict[str, Any]:
-    """Unread first, then newest first."""
+def list_notifications(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
+                       user: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, Any]:
+    """Unread first, then newest first. Pages with limit and offset; total counts every notification of the user."""
     rows = db.execute(
         select(Notification).where(Notification.user_id == user.id)
-        .order_by(Notification.read_at.is_(None).desc(), Notification.id.desc()).limit(limit)
+        .order_by(Notification.read_at.is_(None).desc(), Notification.id.desc()).offset(offset).limit(limit)
     ).scalars()
-    return {"unread": _unread(db, user.id), "items": [_out(n) for n in rows]}
+    total = db.execute(
+        select(func.count()).select_from(Notification).where(Notification.user_id == user.id)
+    ).scalar_one()
+    return {"unread": _unread(db, user.id), "total": total, "offset": offset, "limit": limit,
+            "items": [_out(n) for n in rows]}
 
 
 @router.post("/{notification_id}/read")
