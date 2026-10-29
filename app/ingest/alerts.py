@@ -117,7 +117,7 @@ def build_alerts(df: pd.DataFrame) -> list[Alert]:
 
     # R1 structuring: Cash, USD, under $10k, >=3 within 24h, per sender.
     cash = usd[(usd["payment_format"] == "Cash") & (usd["amount_received"] < 10_000)]
-    for acct, g in cash.sort_values("ts").groupby("from_account"):
+    for acct, g in cash.sort_values("ts").groupby("from_account", observed=True):
         if len(g) < 3:
             continue
         times = g["ts"].tolist()
@@ -134,7 +134,7 @@ def build_alerts(df: pd.DataFrame) -> list[Alert]:
         ("out", "from_account", "to_account", "R2_fan_out"),
         ("in", "to_account", "from_account", "R3_fan_in"),
     ):
-        for acct, g in usd.sort_values("ts").groupby(key_col):
+        for acct, g in usd.sort_values("ts").groupby(key_col, observed=True):
             if g[other_col].nunique() < 10:
                 continue
             times = g["ts"].tolist()
@@ -157,8 +157,8 @@ def build_alerts(df: pd.DataFrame) -> list[Alert]:
 
     # R4 pass-through: in-amount, >=80% sent out within 48h after receipt.
     inbound = usd.sort_values("ts")
-    outbound_by_acct = {a: g.sort_values("ts") for a, g in usd.groupby("from_account")}
-    for acct, g in inbound.groupby("to_account"):
+    outbound_by_acct = {a: g.sort_values("ts") for a, g in usd.groupby("from_account", observed=True)}
+    for acct, g in inbound.groupby("to_account", observed=True):
         if acct not in outbound_by_acct:
             continue
         out_g = outbound_by_acct[acct]

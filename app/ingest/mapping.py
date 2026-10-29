@@ -1,8 +1,10 @@
 """Column mapping for uploaded CSVs (ETL stage 2). Any CSV can be loaded once each schema field is mapped to a column.
 
 A header is matched to a schema field automatically when the names are equal after lowercasing and removing "_",
-"-" and spaces (so "From Account", "from_account" and "FROM-ACCOUNT" all match). Any other header is mapped by hand
-in the UI. The loader reads the mapped columns and returns the same frame as app.ingest.alerts.load_csv.
+"-" and spaces (so "From Account", "from_account" and "FROM-ACCOUNT" all match). Two-column account layouts such as
+HI-Small (sender "Account", receiver "Account.1" after pandas renames the duplicate) are matched through ALIASES.
+Any other header is mapped by hand in the UI. The loader reads the mapped columns and returns the same frame as
+app.ingest.alerts.load_csv, with the text columns stored as categories so a full sync fits in a small instance.
 """
 
 from __future__ import annotations
@@ -26,6 +28,15 @@ SCHEMA: dict[str, bool] = {
     "to_bank": False,
     "is_laundering": False,
 }
+# Normalized header names that stand for a field when the plain name does not match. HI-Small has two "Account"
+# headers: pandas keeps the first as "Account" (sender) and renames the second to "Account.1" (receiver).
+ALIASES: dict[str, tuple[str, ...]] = {
+    "from_account": ("account",),
+    "to_account": ("account.1",),
+}
+# Text fields with few distinct values or repeated account ids. They are stored as categories (see load_mapped).
+CATEGORICAL = ("from_account", "to_account", "from_bank", "to_bank", "receiving_currency", "payment_currency",
+               "payment_format")
 CHUNK = 250_000
 LABEL_VALUES = {"0", "1", "true", "false"}
 
@@ -40,11 +51,17 @@ def read_header(path: Path | str) -> list[str]:
 
 
 def auto_map(header: list[str]) -> dict[str, str]:
-    """schema field -> CSV column, for every field whose normalized name matches a header."""
+    """schema field -> CSV column, for every field whose normalized name (or alias) matches a header."""
     by_name: dict[str, str] = {}
     for col in header:
         by_name.setdefault(normalize(col), col)
-    return {field: by_name[normalize(field)] for field in SCHEMA if normalize(field) in by_name}
+    mapping: dict[str, str] = {}
+    for field in SCHEMA:
+        for name in (normalize(field), *ALIASES.get(field, ())):
+            if name in by_name and by_name[name] not in mapping.values():
+                mapping[field] = by_name[name]
+                break
+    return mapping
 
 
 def mapping_problems(mapping: dict[str, str], header: list[str]) -> list[str]:
@@ -82,24 +99,60 @@ def validate_mapped(path: Path | str, mapping: dict[str, str]) -> dict:
     return report
 
 
+def _clean(field: str, values: pd.Series) -> pd.Series:
+    """Account ids are stripped; other text is kept as the file has it."""
+    return values.str.strip() if field in ("from_account", "to_account") else values
+
+
+def _categories(path: Path | str, mapping: dict[str, str]) -> dict[str, list[str]]:
+    """The distinct values of each mapped categorical field, from a first pass that keeps only those columns."""
+    fields = [f for f in CATEGORICAL if f in mapping]
+    seen: dict[str, set[str]] = {f: set() for f in fields}
+    cols = [mapping[f] for f in fields]
+    if not cols:
+        return seen
+    for chunk in pd.read_csv(path, usecols=cols, chunksize=CHUNK, dtype=str, keep_default_na=False):
+        for field in fields:
+            seen[field].update(_clean(field, chunk[mapping[field]]).unique())
+    return {f: sorted(values) for f, values in seen.items()}
+
+
+def _typed(chunk: pd.DataFrame, cats: dict[str, list[str]]) -> pd.DataFrame:
+    """One chunk in the loader's types. Categorical fields use the shared category list, so chunks concatenate
+    without falling back to plain strings."""
+    def text(field: str):
+        if field not in chunk:
+            return ""  # not mapped: left empty, as before
+        values = _clean(field, chunk[field])
+        if field in cats:
+            return pd.Categorical(values, categories=cats[field])
+        return values
+
+    return pd.DataFrame({
+        "ts": pd.to_datetime(chunk["timestamp"]),
+        "from_bank": text("from_bank"),
+        "from_account": text("from_account"),
+        "to_bank": text("to_bank"),
+        "to_account": text("to_account"),
+        "amount_received": pd.to_numeric(chunk["amount_received"]).astype(float),
+        "receiving_currency": text("receiving_currency"),
+        "amount_paid": pd.to_numeric(chunk["amount_paid"]).astype(float),
+        "payment_currency": text("payment_currency"),
+        "payment_format": text("payment_format"),
+        "is_laundering": (chunk["is_laundering"].str.strip().str.lower().isin(["1", "true"])
+                          if "is_laundering" in chunk else False),
+    })
+
+
 def load_mapped(path: Path | str, mapping: dict[str, str]) -> pd.DataFrame:
     """The transactions as app.ingest.alerts.load_csv returns them: ts, txn_id, from/to account and bank,
-    amounts, currencies, payment format and is_laundering. Optional fields that are not mapped are left empty."""
-    df = pd.concat(_chunks(path, mapping), ignore_index=True)
-    label = (df["is_laundering"].str.strip().str.lower().isin(["1", "true"])
-             if "is_laundering" in df else False)
-    out = pd.DataFrame({
-        "ts": pd.to_datetime(df["timestamp"]),
-        "from_bank": df.get("from_bank", ""),
-        "from_account": df["from_account"].str.strip(),
-        "to_bank": df.get("to_bank", ""),
-        "to_account": df["to_account"].str.strip(),
-        "amount_received": pd.to_numeric(df["amount_received"]).astype(float),
-        "receiving_currency": df["receiving_currency"],
-        "amount_paid": pd.to_numeric(df["amount_paid"]).astype(float),
-        "payment_currency": df["payment_currency"],
-        "payment_format": df["payment_format"],
-        "is_laundering": label,
-    })
-    out["txn_id"] = out.index + 1  # 1-based row id, as in load_csv
-    return out
+    amounts, currencies, payment format and is_laundering. Optional fields that are not mapped are left empty.
+
+    Text columns become categories with one shared category list (two passes over the mapped text columns). Account
+    ids repeat across rows and bank and currency names have a handful of values, so this is far smaller than strings.
+    """
+    cats = _categories(path, mapping)
+    parts = [_typed(chunk, cats) for chunk in _chunks(path, mapping)]
+    df = pd.concat(parts, ignore_index=True)
+    df["txn_id"] = df.index + 1  # 1-based row id, as in load_csv
+    return df

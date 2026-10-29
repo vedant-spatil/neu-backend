@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from langgraph.types import Command
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Alert, Case
@@ -34,8 +35,16 @@ def _attempt(case_id: int) -> int:
         return int((case.state or {}).get("attempt", 0)) if case is not None else 0
 
 
+def active_case_for(db: Session, account_id: str) -> Case | None:
+    """The account's one active case, or None. Superseded duplicates are not returned."""
+    return db.execute(
+        select(Case).where(Case.account_id == account_id, Case.status != "superseded")
+    ).scalars().first()
+
+
 def start_case(db: Session, alert: Alert) -> Case:
-    case = Case(alert_id=alert.id, status="open", risk_score=alert.risk_score, state={})
+    case = Case(alert_id=alert.id, account_id=alert.account_id, status="open",
+                risk_score=alert.risk_score, state={})
     db.add(case)
     db.commit()
     write_event(db, case.id, "ingest_alert", "start", {"alert_id": alert.id})
