@@ -12,6 +12,7 @@ import logging
 import resource
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -94,7 +95,8 @@ def _progress(import_id: int, status: str, **fields) -> None:
         imp = db.get(Import, import_id)
         imp.status = status
         imp.report = {**(imp.report or {}), **fields,
-                      "elapsed_s": round(elapsed, 1), "process_peak_rss_mb": round(peak_mb)}
+                      "elapsed_s": round(elapsed, 1), "process_peak_rss_mb": round(peak_mb),
+                      "updated_at": datetime.now(UTC).isoformat()}
         db.commit()
     log.info("sync %s %s elapsed=%.0fs peak_rss=%.0fMB", import_id, status, elapsed, peak_mb)
     if status in TERMINAL_STATUSES:
@@ -116,7 +118,7 @@ def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
             return
         _progress(import_id, "loading", validation=report, stage="alerts")
         df = load_mapped(path, mapping)
-        _write_alerts(df)
+        _write_alerts(df, on_stage=lambda s: _progress(import_id, "loading", stage=s))
         _progress(import_id, "loading", stage="transactions", rows=len(df))
         _copy_transactions(df)
         accounts = sorted(set(df["from_account"]).union(df["to_account"]))
