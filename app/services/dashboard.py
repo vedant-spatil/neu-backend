@@ -4,7 +4,7 @@ the alert figures stay admin-only. Both the dashboard endpoint and the live stre
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Date, cast, func, select, text
+from sqlalchemy import Date, and_, cast, func, select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -56,12 +56,19 @@ def dashboard_payload(db: Session, user: User) -> dict[str, Any]:
         for r in rules or []:
             alert_rules[r] = alert_rules.get(r, 0) + 1
     payload["alerts_above_threshold_by_rule"] = alert_rules
+    top = (
+        select(Alert.account_id.label("account_id"), func.count().label("alerts"))
+        .where(Alert.risk_score >= _threshold())
+        .group_by(Alert.account_id).order_by(func.count().desc()).limit(10).subquery()
+    )
+    rows = db.execute(
+        select(top.c.account_id, top.c.alerts, Case.id, Case.status)
+        .outerjoin(Case, and_(Case.account_id == top.c.account_id, Case.status != "superseded"))
+        .order_by(top.c.alerts.desc())
+    ).all()
     payload["top_accounts_by_alerts"] = [
-        {"account_id": a, "alerts": n}
-        for a, n in db.execute(
-            select(Alert.account_id, func.count()).where(Alert.risk_score >= _threshold())
-            .group_by(Alert.account_id).order_by(func.count().desc()).limit(10)
-        ).all()
+        {"account_id": a, "alerts": n, "case_id": cid, "case_status": cstatus}
+        for a, n, cid, cstatus in rows
     ]
     buckets = dict(
         db.execute(select(func.floor(Alert.risk_score * 10), func.count()).group_by(text("1"))).all()

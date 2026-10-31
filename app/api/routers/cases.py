@@ -11,6 +11,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 from sqlalchemy import Text, cast, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session, require_role
@@ -130,16 +131,25 @@ def open_case(
     _: User = Depends(_admin),
     db: Session = Depends(db_session),
 ) -> CaseOut:
-    """Opens a case for an alert (admin only). An alert has one case: if it already has one, that case is returned
-    (200) and nothing new starts. Otherwise a case is created and its workflow runs in the background (202)."""
+    """Opens a case for an alert (admin only). An account has one active case: if it already has one, that case is
+    returned (200) and nothing new starts. Otherwise a case is created and its workflow runs in the background (202)."""
     alert = db.get(Alert, alert_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="alert not found")
-    existing = db.execute(select(Case).where(Case.alert_id == alert_id).order_by(Case.id.desc())).scalars().first()
+    existing = case_service.active_case_for(db, alert.account_id)
     if existing is not None:
         response.status_code = status.HTTP_200_OK
         return _case_out(existing)
-    case = case_service.start_case(db, alert)
+    try:
+        case = case_service.start_case(db, alert)
+    except IntegrityError:
+        # A concurrent request opened the account's case first; the unique index refused a second one.
+        db.rollback()
+        existing = case_service.active_case_for(db, alert.account_id)
+        if existing is None:
+            raise
+        response.status_code = status.HTTP_200_OK
+        return _case_out(existing)
     txn_ids = [int(i) for i in (alert.raw_json or {}).get("txn_ids", [])]
     background.add_task(
         case_service.run_case, case.id, alert.id, alert.account_id, alert.ts.isoformat(),

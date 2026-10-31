@@ -21,13 +21,14 @@ from app.db.models import Case, Decision
 from app.db.session import SessionLocal
 from app.orchestration.state import CaseState
 from app.services.audit import write_event
+from app.services.telemetry import timed
 
 
 def _node(fn: Callable[[Session, dict[str, Any]], dict[str, Any]]) -> Callable[[CaseState], dict[str, Any]]:
     """Each node gets its own DB session, so parallel branches never share one."""
 
     def run(state: CaseState) -> dict[str, Any]:
-        with SessionLocal() as db:
+        with timed("node", node=fn.__name__, case_id=state.get("case_id")), SessionLocal() as db:
             return fn(db, dict(state))
 
     run.__name__ = fn.__name__

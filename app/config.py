@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     model_batch_size: int = 4096
     alert_threshold: float = 0.40
 
+    # CloudWatch Logs group the API writes to (awslogs driver). The admin observability page reads it; unset means
+    # the page reports that observability is not configured. observability_region defaults to bedrock_region.
+    observability_log_group: str | None = None
+    observability_region: str | None = None
+
     # Disabled: Celery and Redis are commented out (see app/tasks/__init__.py).
     # redis_url: str = "redis://localhost:6379/0"
 

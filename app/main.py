@@ -3,7 +3,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import auth, cases, health, imports, notifications, projects, stream, users
+from app.api.routers import (
+    auth,
+    cases,
+    health,
+    imports,
+    notifications,
+    observability,
+    projects,
+    stream,
+    users,
+)
 from app.config import get_settings
 
 
@@ -37,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(users.router)
     app.include_router(notifications.router)
     app.include_router(stream.router)
+    app.include_router(observability.router)
     return app
 
 

@@ -1,7 +1,8 @@
 import threading
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -94,4 +95,38 @@ def change_password(body: ChangePasswordIn, user: User = Depends(current_user),
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user)) -> UserOut:
-    return UserOut(id=user.id, email=user.email, role=user.role)
+    return UserOut(id=user.id, email=user.email, role=user.role, has_avatar=user.avatar_type is not None)
+
+
+AVATAR_MAX_BYTES = 2 * 1024**2
+_IMAGE_SIGNATURES = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"))
+
+
+def avatar_type_of(data: bytes) -> str | None:
+    """The image type from the file's first bytes (PNG or JPEG only), or None. The client's type is not trusted."""
+    for signature, mime in _IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return mime
+    return None
+
+
+@router.put("/me/avatar", response_model=UserOut)
+def set_avatar(file: UploadFile, user: User = Depends(current_user), db: Session = Depends(db_session)) -> UserOut:
+    data = file.file.read(AVATAR_MAX_BYTES + 1)
+    if len(data) > AVATAR_MAX_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="picture over 2 MB")
+    mime = avatar_type_of(data)
+    if mime is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="use a PNG or JPEG picture")
+    user.avatar = data
+    user.avatar_type = mime
+    db.commit()
+    return UserOut(id=user.id, email=user.email, role=user.role, has_avatar=True)
+
+
+@router.get("/me/avatar")
+def get_avatar(user: User = Depends(current_user)) -> Response:
+    if user.avatar is None or user.avatar_type is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="no picture")
+    return Response(content=user.avatar, media_type=user.avatar_type,
+                    headers={"Cache-Control": "private, no-cache"})

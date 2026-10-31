@@ -2,7 +2,9 @@ from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
+    LargeBinary,
     UniqueConstraint,
+    text,
     JSON,
     Boolean,
     Date,
@@ -32,6 +34,9 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), default="investigator")  # admin | qa
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Profile picture: PNG or JPEG, checked by the API. Deferred, so it loads only when it is served.
+    avatar: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
+    avatar_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class Alert(Base):
@@ -95,9 +100,13 @@ class Party(Base):
 
 class Case(Base):
     __tablename__ = "cases"
+    # One active case per account. A superseded case (a duplicate kept for the audit trail) is outside the index.
+    __table_args__ = (Index("uq_cases_account_active", "account_id", unique=True,
+                            postgresql_where=text("status <> 'superseded'")),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     alert_id: Mapped[int] = mapped_column(ForeignKey("alerts.id"), index=True)
+    account_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="open")
     risk_score: Mapped[float] = mapped_column(Float, default=0.0)
     state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

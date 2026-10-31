@@ -41,8 +41,8 @@ def test_auto_map_matches_names_and_leaves_the_rest_for_hand_mapping():
     assert auto["timestamp"] == "Timestamp"
     assert auto["amount_paid"] == "Amount Paid"
     assert auto["payment_format"] == "Payment Format"
-    assert "from_account" not in auto  # "Account" does not match "from_account"
-    assert "to_account" not in auto    # "Account.1" does not match "to_account"
+    assert auto["from_account"] == "Account"    # HI-Small sender, matched through ALIASES
+    assert auto["to_account"] == "Account.1"    # HI-Small receiver, matched through ALIASES
 
 
 def test_mapping_problems_reports_missing_required_and_bad_columns():

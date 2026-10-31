@@ -25,8 +25,8 @@ Hit = tuple[str, str, pd.Timestamp, float, list[int], bool]
 def _edges(usd: pd.DataFrame) -> pd.DataFrame:
     e = pd.DataFrame(
         {
-            "src": usd["from_account"].values,
-            "dst": usd["to_account"].values,
+            "src": usd["from_account"].astype(object).values,
+            "dst": usd["to_account"].astype(object).values,
             "t": usd["ts"].values,
             "amt": usd["amount_received"].astype(float).values,
             "id": usd["txn_id"].astype(int).values,
