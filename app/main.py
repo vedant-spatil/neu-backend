@@ -24,6 +24,10 @@ async def lifespan(_: FastAPI):
     from app.services.sync import fail_interrupted_imports
 
     get_graph()
+    # With TRIAGE_MODEL=xgb, warn now if the configured model run has no scores (cases would use rule scores).
+    from app.services.triage_check import warn_if_no_scores
+
+    warn_if_no_scores()
     # A sync thread does not survive a restart, so any import still busy at startup was interrupted.
     fail_interrupted_imports()
     yield

@@ -17,8 +17,10 @@ import resource
 import time
 from bisect import bisect_right
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from app.ingest.graph_rules import graph_hits
@@ -87,13 +89,43 @@ def _usd(df: pd.DataFrame) -> pd.DataFrame:
     return df[(df["receiving_currency"] == "US Dollar") & (df["payment_currency"] == "US Dollar")]
 
 
-def _progress(stage: str, started: float) -> None:
-    """Progress line for long runs: elapsed seconds and peak memory (Linux ru_maxrss is in KB)."""
+def _progress(stage: str, started: float, on_stage: Callable[[str], None] | None = None) -> None:
+    """Progress line for long runs: elapsed seconds and peak memory (Linux ru_maxrss is in KB). on_stage gets the
+    stage name too, so the sync can show it on the import page."""
     peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     print(f"[alerts] {stage} elapsed={time.perf_counter() - started:.0f}s peak_rss={peak_mb:.0f}MB", flush=True)
+    if on_stage is not None:
+        on_stage(stage)
 
 
-def build_alerts(df: pd.DataFrame) -> list[Alert]:
+def _pass_through(usd: pd.DataFrame):
+    """Yields (account, ts, amount received, txn id, laundering) for each inbound transfer whose receiver sends out at
+    least 80% of it within 48 hours. Outgoing transfers are sorted once and indexed by account with numpy arrays, so
+    no per-account frame is kept in memory (the earlier version held one DataFrame per account)."""
+    out = usd.sort_values("ts", kind="stable")
+    out_ts = out["ts"].to_numpy(dtype="datetime64[ns]").astype("int64")
+    out_amt = out["amount_paid"].to_numpy(dtype=float)
+    positions = out.groupby("from_account", observed=True).indices  # account -> ascending row positions
+    window_ns = pd.Timedelta(H48).value
+    inbound = usd.sort_values("ts", kind="stable")
+    for acct, g in inbound.groupby("to_account", observed=True):
+        idx = positions.get(acct)
+        if idx is None:
+            continue
+        times = out_ts[idx]
+        cum = np.cumsum(out_amt[idx])
+        for t0, received, txn_id, lab in zip(g["ts"], g["amount_received"], g["txn_id"], g["is_laundering"]):
+            t0_ns = pd.Timestamp(t0).value
+            lo = np.searchsorted(times, t0_ns, side="right")
+            hi = np.searchsorted(times, t0_ns + window_ns, side="right")
+            if hi <= lo:
+                continue
+            sent = cum[hi - 1] - (cum[lo - 1] if lo > 0 else 0.0)
+            if received > 0 and sent >= 0.8 * received:
+                yield acct, t0, float(received), int(txn_id), bool(lab)
+
+
+def build_alerts(df: pd.DataFrame, on_stage: Callable[[str], None] | None = None) -> list[Alert]:
     started = time.perf_counter()
     usd = _usd(df)
     print(f"[alerts] usd rows={len(usd)} of {len(df)}", flush=True)
@@ -153,34 +185,20 @@ def build_alerts(df: pd.DataFrame) -> list[Alert]:
                 counts[others[i]] -= 1
                 if counts[others[i]] == 0:
                     del counts[others[i]]
-        _progress(f"{rule} done", started)
+        _progress(f"{rule} done", started, on_stage)
 
-    # R4 pass-through: in-amount, >=80% sent out within 48h after receipt.
-    inbound = usd.sort_values("ts")
-    outbound_by_acct = {a: g.sort_values("ts") for a, g in usd.groupby("from_account", observed=True)}
-    for acct, g in inbound.groupby("to_account", observed=True):
-        if acct not in outbound_by_acct:
-            continue
-        out_g = outbound_by_acct[acct]
-        out_times = out_g["ts"].tolist()
-        out_cum = out_g["amount_paid"].cumsum().tolist()
-        for t0, received, txn_id, lab in zip(g["ts"], g["amount_received"], g["txn_id"], g["is_laundering"]):
-            lo = bisect_right(out_times, t0)
-            hi = bisect_right(out_times, t0 + H48)
-            if hi <= lo:
-                continue
-            sent = out_cum[hi - 1] - (out_cum[lo - 1] if lo > 0 else 0.0)
-            if received > 0 and sent >= 0.8 * received:
-                add(acct, "R4_pass_through", t0, float(received), [int(txn_id)], bool(lab))
+    # R4 pass-through: in-amount, >=80% sent out within 48h after receipt (see _pass_through).
+    for acct, t0, received, txn_id, lab in _pass_through(usd):
+        add(acct, "R4_pass_through", t0, received, [txn_id], lab)
 
-    _progress("R4 done", started)
+    _progress("R4 done", started, on_stage)
 
     # R5 to R7: graph groups over the USD edges.
     graph_count = 0
     for hit in graph_hits(usd):
         add(*hit)
         graph_count += 1
-    _progress(f"R5-R7 done, {graph_count} group hits", started)
+    _progress(f"R5-R7 done, {graph_count} group hits", started, on_stage)
 
     out: list[Alert] = []
     for a in alerts.values():

@@ -81,9 +81,17 @@ class Settings(BaseSettings):
         if self.neo4j_password == "change-me-neo4j":
             raise ValueError("APP_ENV=prod needs NEO4J_PASSWORD set, not the dev default")
 
+    def check_triage(self) -> None:
+        """XGBoost triage reads scores for TRIAGE_MODEL_RUN. Without a run every case would fall back to rules."""
+        if self.triage_model not in ("rules", "xgb"):
+            raise ValueError(f"TRIAGE_MODEL must be rules or xgb, not {self.triage_model!r}")
+        if self.triage_model == "xgb" and not self.triage_model_run:
+            raise ValueError("TRIAGE_MODEL=xgb needs TRIAGE_MODEL_RUN (the model_version whose scores cases read)")
+
 
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
     settings.check_production()
+    settings.check_triage()
     return settings

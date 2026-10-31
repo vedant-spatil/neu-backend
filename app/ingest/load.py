@@ -17,7 +17,7 @@ import csv
 import io
 import json
 import random
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date, timedelta
 
 import httpx
@@ -136,10 +136,10 @@ def _load_neo4j(df: pd.DataFrame, accounts: list[str]) -> None:
             print(f"neo4j edges {min(start + NEO4J_BATCH, len(df))}/{len(df)}", flush=True)
 
 
-def _write_alerts(df: pd.DataFrame) -> None:
+def _write_alerts(df: pd.DataFrame, on_stage: Callable[[str], None] | None = None) -> None:
     """Replace unreferenced alerts with grouped ones in ONE transaction, so a crash leaves the
     old table intact. Alerts that already have cases are kept (cases.alert_id links)."""
-    alerts = build_alerts(df)
+    alerts = build_alerts(df, on_stage)
     print(f"alerts={len(alerts)}", flush=True)
     rows = [
         {
