@@ -82,21 +82,17 @@ services:
     env_file: .env
     environment:
       APP_ENV: prod   # refuses the dev JWT secret and Neo4j password (app/config.py)
-      # Inside the containers: 'localhost' would be the container itself, so these point at the compose services.
-      # APP_DATABASE_URL / APP_NEO4J_URI in .env point the API at Supabase / Aura instead. DATABASE_URL in .env is for
-      # running the API on the host and is not used here.
-      DATABASE_URL: ${APP_DATABASE_URL:-postgresql+psycopg://aml:${POSTGRES_PASSWORD}@postgres:5432/aml}
-      NEO4J_URI: ${APP_NEO4J_URI:-bolt://neo4j:7687}
+      # The API reads its databases from APP_DATABASE_URL and APP_NEO4J_URI in .env (Supabase and Aura). They are
+      # required: compose stops with an error if either is missing, rather than falling back to local containers.
+      # DATABASE_URL in .env is for running the API on the host and is not used here.
+      DATABASE_URL: ${APP_DATABASE_URL:?set APP_DATABASE_URL in .env (Supabase session pooler URL)}
+      NEO4J_URI: ${APP_NEO4J_URI:?set APP_NEO4J_URI in .env (Aura connection URI)}
       YENTE_URL: http://yente:8000
     expose:
       - "8000"   # reached only by nginx
     volumes:
       - uploads:/app/data/uploads   # CSV uploads survive container recreation; a sync can be re-run from the file
     depends_on:
-      postgres:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
       yente:
         condition: service_started
     mem_limit: 1g
