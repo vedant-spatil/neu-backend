@@ -164,20 +164,36 @@ def _clear_graph() -> None:
             pass
 
 
-def two_hop_slice(df: pd.DataFrame, flagged: set[str]) -> tuple[pd.DataFrame, list[str]]:
-    """Transfers whose two ends both lie within two hops of a flagged account, and the accounts they touch.
+TOP_NEIGHBOURS = 10  # per account and hop: its most frequent counterparties, in either direction
 
-    Two hops keeps what the flow tracer reads: fan-out and fan-in use a flagged account's own transfers, and a cycle
-    of up to four accounts through it uses only accounts within two hops. Transfers further out are not loaded."""
+
+def _top_neighbours(src: pd.Series, dst: pd.Series, nodes: set[str]) -> set[str]:
+    """For each account in nodes, its TOP_NEIGHBOURS counterparties by number of transfers (either direction)."""
+    out_sel = src.isin(nodes)
+    in_sel = dst.isin(nodes)
+    pairs = pd.concat([
+        pd.DataFrame({"node": src[out_sel], "other": dst[out_sel]}),
+        pd.DataFrame({"node": dst[in_sel], "other": src[in_sel]}),
+    ], ignore_index=True)
+    counts = pairs.groupby(["node", "other"], observed=True).size().rename("n").reset_index()
+    top = (counts.sort_values(["node", "n", "other"], ascending=[True, False, True])
+           .groupby("node", observed=True).head(TOP_NEIGHBOURS))
+    return set(top["other"])
+
+
+def two_hop_slice(df: pd.DataFrame, flagged: set[str]) -> tuple[pd.DataFrame, list[str]]:
+    """Transfers whose two ends both lie in the flagged accounts' two-hop neighbourhood, and the accounts they touch.
+
+    Each hop keeps only the TOP_NEIGHBOURS most frequent counterparties of every account in the previous hop, and the
+    flagged accounts are always kept. Two hops is what the flow tracer reads: fan-out and fan-in use a flagged account's
+    own transfers, and a cycle of up to four accounts through it uses only accounts within two hops. This bounds the
+    Neo4j graph so it fits the free tiers. The alert rules read the full transfers, not this slice."""
     if not flagged:
         return df.iloc[0:0], []
     src, dst = df["from_account"], df["to_account"]
-
-    def neighbours(nodes: set[str]) -> set[str]:
-        return set(dst[src.isin(nodes)]) | set(src[dst.isin(nodes)])
-
-    one_hop = set(flagged) | neighbours(set(flagged))
-    two_hop = one_hop | neighbours(one_hop)
+    flagged_set = set(flagged)
+    one_hop = flagged_set | _top_neighbours(src, dst, flagged_set)
+    two_hop = one_hop | _top_neighbours(src, dst, one_hop)
     edges = df[src.isin(two_hop) & dst.isin(two_hop)]
     nodes = sorted(set(edges["from_account"]).union(edges["to_account"]))
     return edges, nodes
