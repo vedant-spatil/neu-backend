@@ -191,7 +191,8 @@ def list_projects(user: User = Depends(require_role("admin", "qa")), db: Session
         select(ProjectAccount.project_id, func.count()).where(ProjectAccount.project_id.in_(ids))
         .group_by(ProjectAccount.project_id)
     ).all()) if ids else {}
-    return [{"id": p.id, "name": p.name, "members": members.get(p.id, 0), "accounts": accounts.get(p.id, 0)}
+    return [{"id": p.id, "name": p.name, "members": members.get(p.id, 0), "accounts": accounts.get(p.id, 0),
+             "created_at": p.created_at.isoformat() if p.created_at else None}
             for p in projects]
 
 
