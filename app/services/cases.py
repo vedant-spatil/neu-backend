@@ -15,6 +15,7 @@ from app.db.models import Alert, Case
 from app.orchestration.graph import get_graph
 from app.services.audit import write_event
 from app.services.cache import invalidate
+from app.services.telemetry import timed
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,8 @@ def run_case(case_id: int, alert_id: int, account_id: str, alert_ts: str, rules:
         "status": "open",
     }
     try:
-        graph.invoke(initial, config)
+        with timed("case_run", case_id=case_id, attempt=attempt, mode="start"):
+            graph.invoke(initial, config)
     except Exception as exc:
         log.exception("case %s run failed", case_id)
         _mark_failed(case_id, str(exc))
@@ -82,7 +84,8 @@ def resume_case(case_id: int, decision: dict[str, Any]) -> None:
     config = {"configurable": {"thread_id": thread_id(case_id, _attempt(case_id))},
               "recursion_limit": RECURSION_LIMIT}
     try:
-        graph.invoke(Command(resume=decision), config)
+        with timed("case_run", case_id=case_id, mode="resume"):
+            graph.invoke(Command(resume=decision), config)
     finally:
         invalidate()
 
