@@ -11,7 +11,7 @@ from langgraph.types import Command
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Alert, Case
+from app.db.models import Alert, Case, CaseAccount, CaseAlert
 from app.orchestration.graph import get_graph
 from app.services.audit import write_event
 from app.services.cache import invalidate
@@ -37,6 +37,17 @@ def _attempt(case_id: int) -> int:
         return int((case.state or {}).get("attempt", 0)) if case is not None else 0
 
 
+def _clear_members_changed(case_id: int) -> None:
+    """A workflow that starts has the case's current members, so the "rerun needed" flag no longer applies."""
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        case = db.get(Case, case_id)
+        if case is not None and (case.state or {}).get("members_changed"):
+            case.state = {k: v for k, v in case.state.items() if k != "members_changed"}
+            db.commit()
+
+
 def active_case_for(db: Session, account_id: str) -> Case | None:
     """The account's one active case, or None. Superseded duplicates are not returned."""
     return db.execute(
@@ -48,6 +59,10 @@ def start_case(db: Session, alert: Alert) -> Case:
     case = Case(alert_id=alert.id, account_id=alert.account_id, status="open",
                 risk_score=alert.risk_score, state={})
     db.add(case)
+    db.flush()
+    # Membership rows, so case grouping sees this case (plan: case grouping, step 1).
+    db.add(CaseAccount(case_id=case.id, account_id=alert.account_id, role="subject", active=True))
+    db.add(CaseAlert(case_id=case.id, alert_id=alert.id, active=True))
     db.commit()
     write_event(db, case.id, "ingest_alert", "start", {"alert_id": alert.id})
     invalidate()
@@ -57,6 +72,7 @@ def start_case(db: Session, alert: Alert) -> Case:
 def run_case(case_id: int, alert_id: int, account_id: str, alert_ts: str, rules: list[str], risk: float,
              txn_ids: list[int], attempt: int = 0) -> None:
     """Background task entry point. Errors are logged and recorded as a failed case."""
+    _clear_members_changed(case_id)
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id(case_id, attempt)}, "recursion_limit": RECURSION_LIMIT}
     initial: dict[str, Any] = {

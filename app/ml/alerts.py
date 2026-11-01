@@ -56,14 +56,16 @@ def build_alert_rows(scores: pd.DataFrame, edge_map: pd.DataFrame, model_version
 
 
 def write_model_alerts(engine: Engine, rows: list[dict], model_version: str) -> int:
-    """Replaces the model alerts for this model_version. Model alerts with a case are kept (cases.alert_id FK).
+    """Replaces the model alerts for this model_version. Model alerts that a case holds, as primary (cases.alert_id) or
+    as a member (case_alerts), are kept.
 
     Rule alerts are never touched. Returns the number of rows inserted.
     """
     with engine.begin() as conn:
         conn.execute(text(
             "DELETE FROM alerts WHERE source = :source AND model_version = :mv "
-            "AND id NOT IN (SELECT alert_id FROM cases WHERE alert_id IS NOT NULL)"
+            "AND id NOT IN (SELECT alert_id FROM cases WHERE alert_id IS NOT NULL) "
+            "AND id NOT IN (SELECT alert_id FROM case_alerts)"
         ), {"source": SOURCE, "mv": model_version})
         for start in range(0, len(rows), 5_000):
             conn.execute(Alert.__table__.insert(), rows[start:start + 5_000])

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import current_user, db_session, require_role
 from app.db.models import Alert, Case, CaseEvent, SarDraft, Transaction, User
 from app.services import cases as case_service
+from app.services import membership
 from app.services.access import case_scope, get_visible_case
 from app.services.audit import write_event
 from app.services.cache import get_or_compute, invalidate
@@ -44,10 +45,13 @@ class CaseOut(BaseModel):
     status: str
     risk_score: float
     assignee_id: int | None = None
+    # True when accounts or alerts were added or merged into a case that has already run (plan: case grouping).
+    members_changed: bool = False
 
 
 def _case_out(c: Case) -> CaseOut:
-    return CaseOut(id=c.id, alert_id=c.alert_id, status=c.status, risk_score=c.risk_score, assignee_id=c.assignee_id)
+    return CaseOut(id=c.id, alert_id=c.alert_id, status=c.status, risk_score=c.risk_score, assignee_id=c.assignee_id,
+                   members_changed=bool((c.state or {}).get("members_changed")))
 
 
 class DecisionIn(BaseModel):
@@ -157,6 +161,22 @@ def open_case(
         list(alert.rules or []), alert.risk_score, txn_ids,
     )
     return _case_out(case)
+
+
+@router.post("/cases/build", status_code=status.HTTP_202_ACCEPTED)
+def build_cases_now(
+    background: BackgroundTasks,
+    _: User = Depends(_admin),
+    db: Session = Depends(db_session),
+) -> dict[str, int]:
+    """Groups the alerts into cases now (admin). The same build runs after each sync. Running it again adds nothing
+    that is already there. New cases' workflows run in the background."""
+    try:
+        result = membership.build_cases(db)
+    except membership.BuildBusy:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a case build is already running")
+    membership.start_jobs(result.jobs)
+    return result.summary()
 
 
 class CasePage(BaseModel):

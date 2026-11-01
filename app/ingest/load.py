@@ -17,13 +17,15 @@ import csv
 import io
 import json
 import random
+from collections import defaultdict
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import httpx
 import pandas as pd
 from faker import Faker
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from app.db.models import Alert, Base, Party, Transaction
 from app.db.session import SessionLocal, engine
@@ -136,13 +138,71 @@ def _load_neo4j(df: pd.DataFrame, accounts: list[str]) -> None:
             print(f"neo4j edges {min(start + NEO4J_BATCH, len(df))}/{len(df)}", flush=True)
 
 
+UPSERT_BATCH = 20_000
+UPDATE_COLUMNS = ("amount", "ts", "risk_score", "rules", "is_laundering", "raw_json")
+# Rule alerts with the link flag: linked means a case holds the alert as primary or member (active or superseded).
+EXISTING_RULE_ALERTS_SQL = """
+SELECT a.id, a.account_id, a.rules,
+       (EXISTS (SELECT 1 FROM cases c WHERE c.alert_id = a.id)
+        OR EXISTS (SELECT 1 FROM case_alerts ca WHERE ca.alert_id = a.id)) AS linked
+FROM alerts a
+WHERE a.source = 'rules'
+"""
+
+
+@dataclass(frozen=True)
+class UpsertPlan:
+    update: dict[tuple[str, str], int]  # key -> id of the row kept and updated in place
+    insert: list[tuple[str, str]]  # keys with no row yet
+    delete: list[int]  # unlinked rows to delete: duplicates, and keys no longer produced
+    kept_unproduced: int  # linked rows whose key is no longer produced: kept, so their cases stay valid
+    linked_duplicates: int  # extra linked rows for one key: kept and reported, not deleted
+
+
+def alert_key(account_id: str, rules: list[str] | None) -> tuple[str, str]:
+    """A rule alert's identity: one row per account and rule (see ingest/alerts.py)."""
+    return (account_id, rules[0] if rules else "")
+
+
+def plan_upsert(existing: dict[tuple[str, str], list[tuple[int, bool]]], produced: set[tuple[str, str]]) -> UpsertPlan:
+    """What the sync does to the existing rule alerts. `existing` maps a key to its rows as (id, linked). For a key with
+    several rows, the linked row (or else the lowest id) is kept and updated; the rest are deleted if unlinked."""
+    update: dict[tuple[str, str], int] = {}
+    delete: list[int] = []
+    kept_unproduced = 0
+    linked_duplicates = 0
+    for key, rows in existing.items():
+        keep_id, keep_linked = max(rows, key=lambda r: (r[1], -r[0]))
+        for row_id, linked in rows:
+            if row_id == keep_id:
+                continue
+            if linked:
+                linked_duplicates += 1
+            else:
+                delete.append(row_id)
+        if key in produced:
+            update[key] = keep_id
+        elif keep_linked:
+            kept_unproduced += 1
+        else:
+            delete.append(keep_id)
+    insert = sorted(k for k in produced if k not in existing)
+    return UpsertPlan(update, insert, sorted(delete), kept_unproduced, linked_duplicates)
+
+
+def _chunks(items: list, size: int) -> Iterator[list]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def _write_alerts(df: pd.DataFrame, on_stage: Callable[[str], None] | None = None) -> None:
-    """Replace unreferenced alerts with grouped ones in ONE transaction, so a crash leaves the
-    old table intact. Alerts that already have cases are kept (cases.alert_id links)."""
+    """Upserts the rule alerts in ONE transaction, so a crash leaves the old table intact. A rule alert keeps its id
+    across syncs (keyed by account and rule), so case links stay valid and re-syncs do not duplicate alerts. Model
+    alerts (source='model') are owned by app.pipeline.run and are not touched here."""
     alerts = build_alerts(df, on_stage)
     print(f"alerts={len(alerts)}", flush=True)
-    rows = [
-        {
+    rows = {
+        alert_key(a.account_id, a.rules): {
             "account_id": a.account_id, "amount": a.amount, "ts": a.ts.to_pydatetime(),
             "source_label": "HI-Small", "risk_score": a.risk_score, "rules": a.rules,
             "is_laundering": a.is_laundering,
@@ -154,13 +214,26 @@ def _write_alerts(df: pd.DataFrame, on_stage: Callable[[str], None] | None = Non
             },
         }
         for a in alerts
-    ]
+    }
     with engine.begin() as conn:
-        # Rule alerts only: model alerts (source='model') are owned by app.pipeline.run.
-        conn.execute(text("DELETE FROM alerts WHERE source = 'rules' AND id NOT IN (SELECT alert_id FROM cases)"))
-        for start in range(0, len(rows), 20_000):
-            conn.execute(Alert.__table__.insert(), rows[start : start + 20_000])
-    print("alerts written", flush=True)
+        existing: dict[tuple[str, str], list[tuple[int, bool]]] = defaultdict(list)
+        for row_id, account_id, rules, linked in conn.execute(text(EXISTING_RULE_ALERTS_SQL)):
+            existing[alert_key(account_id, rules)].append((row_id, bool(linked)))
+        plan = plan_upsert(dict(existing), set(rows))
+        for ids in _chunks(plan.delete, UPSERT_BATCH):
+            conn.execute(Alert.__table__.delete().where(Alert.__table__.c.id.in_(ids)))
+        if plan.update:
+            stmt = Alert.__table__.update().where(Alert.__table__.c.id == bindparam("row_id")).values(
+                {c: bindparam(f"v_{c}") for c in UPDATE_COLUMNS})
+            keys = list(plan.update)
+            for batch in _chunks(keys, UPSERT_BATCH):
+                conn.execute(stmt, [
+                    {"row_id": plan.update[k], **{f"v_{c}": rows[k][c] for c in UPDATE_COLUMNS}} for k in batch
+                ])
+        for batch in _chunks(plan.insert, UPSERT_BATCH):
+            conn.execute(Alert.__table__.insert(), [rows[k] for k in batch])
+    print(f"alerts written: updated={len(plan.update)} inserted={len(plan.insert)} deleted={len(plan.delete)} "
+          f"kept_unproduced={plan.kept_unproduced} linked_duplicates={plan.linked_duplicates}", flush=True)
 
 
 def main() -> int:

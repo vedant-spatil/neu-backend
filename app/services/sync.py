@@ -1,9 +1,10 @@
 """Sync an uploaded CSV: validate it with the saved column mapping, then load it through the ingest path. Runs in a
-background thread. Progress is written to imports.status and imports.report, which the frontend polls. The sync opens
-no cases: a case starts only when an investigator opens it from the alert queue (each case runs the LLM workflow).
+background thread. Progress is written to imports.status and imports.report, which the frontend polls. After the load,
+the sync builds cases from the grouped alerts (services/membership.py). Each new case's LLM workflow then runs in a
+background thread. A build error is recorded in the report and does not fail the import.
 
 Replace semantics, as in app.ingest.load: transactions, parties and the account graph are replaced on every sync.
-Rule alerts that already have cases are kept, and so are model alerts.
+Rule alerts that a case holds (as primary or member) are kept, and so are model alerts.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from app.ingest.load import (
 from app.ingest.mapping import load_mapped, validate_mapped
 from app.services.cache import invalidate
 from app.services.graph_store import driver
+from app.services.membership import BuildBusy, build_cases, start_jobs
 from app.services.notify import notify
 
 TERMINAL_STATUSES = {"triaged", "rejected", "failed"}
@@ -126,12 +128,28 @@ def _run(import_id: int, path: str, mapping: dict[str, str]) -> None:
         _replace_parties(accounts)
         _progress(import_id, "loading", stage="graph")
         graph_edges = _replace_graph(df)
-        # No cases are opened here. Each case runs the LLM workflow, so a case starts only when an investigator opens
-        # it from the alert queue.
-        _progress(import_id, "triaged", stage="done", cases_opened=0, graph_edges=graph_edges)
+        _progress(import_id, "loading", stage="cases")
+        cases, jobs, cases_error = _build_cases()
+        _progress(import_id, "triaged", stage="done", cases_opened=cases.get("created", 0), cases=cases,
+                  cases_error=cases_error, graph_edges=graph_edges)
+        start_jobs(jobs)
     except Exception as exc:
         log.exception("sync %s failed", import_id)
         _progress(import_id, "failed", error=str(exc)[:500])
+
+
+def _build_cases() -> tuple[dict[str, int], list, str | None]:
+    """Groups the new alerts into cases. Returns the counts, the workflows to start, and an error message if the build
+    failed. A build already running (a manual one) is reported, not retried."""
+    try:
+        with SessionLocal() as db:
+            result = build_cases(db)
+        return result.summary(), result.jobs, None
+    except BuildBusy:
+        return {}, [], "case build already running; use Build cases once it finishes"
+    except Exception as exc:
+        log.exception("case build after sync failed")
+        return {}, [], str(exc)[:500]
 
 
 def _replace_parties(accounts: list[str]) -> None:
