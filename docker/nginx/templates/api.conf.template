@@ -28,10 +28,15 @@ server {
     # Case runs and imports can take a while.
     proxy_read_timeout 300s;
 
+    # Docker's DNS. With the upstream in a variable, nginx looks up "api" on each request. Without this, nginx resolves it
+    # once at startup and keeps the old container IP, so every API recreate returned 502 until nginx was restarted.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $api_upstream http://api:8000;
+
     # Live updates (server-sent events): no buffering, and a long timeout for the held connection.
     # CSV upload: nginx forwards the body as it arrives instead of writing all ~475 MB to disk first.
     location /api/imports {
-        proxy_pass http://api:8000;
+        proxy_pass $api_upstream;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -42,7 +47,7 @@ server {
     }
 
     location /api/stream {
-        proxy_pass http://api:8000;
+        proxy_pass $api_upstream;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -53,7 +58,7 @@ server {
     }
 
     location / {
-        proxy_pass http://api:8000;
+        proxy_pass $api_upstream;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
