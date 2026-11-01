@@ -2,8 +2,9 @@
 button. services/grouping.py holds the rules. This module reads the database, applies the rules and writes the audit
 trail.
 
-A build is idempotent: a second build over the same alerts adds nothing and writes no events. At most
-`max_cases_per_run` new cases start per build (each one runs the LLM workflow). The rest wait for the next build.
+A build is idempotent: a second build over the same alerts adds nothing and writes no events. A build creates every case
+it finds, as "pending". No workflow starts in a build. An investigator starts the audit timeline for selected pending
+cases (run_selected), which runs them one at a time.
 
 Memory: the build reads alert columns without raw_json, and reads transfers in batches of accounts. Account names are
 mapped to small integers for the grouping, so the transfer table stays compact.
@@ -13,8 +14,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
-from typing import NamedTuple
+from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -70,28 +71,65 @@ class BuildResult:
     merged: int = 0
     deferred: int = 0
     unchanged: int = 0
-    queued: int = 0
-    jobs: list[Job] = field(default_factory=list)
 
     def summary(self) -> dict[str, int]:
         return {"created": self.created, "added": self.added, "merged": self.merged, "deferred": self.deferred,
-                "unchanged": self.unchanged, "queued": self.queued}
+                "unchanged": self.unchanged}
 
 
-def build_cases(db: Session, threshold: float | None = None, max_new: int | None = None) -> BuildResult:
-    """Groups the alerts at or above the threshold into cases. Raises BuildBusy if another build is running.
-    The caller starts the workflows in `result.jobs` (start_jobs)."""
+# Progress of the build that is running (or the last one), for the loader. Read by the API and written by the build.
+_progress_lock = threading.Lock()
+_progress: dict[str, Any] = {"running": False, "done": 0, "total": 0, "summary": None, "error": None}
+
+
+def build_progress() -> dict[str, Any]:
+    with _progress_lock:
+        return dict(_progress)
+
+
+def build_cases(db: Session, threshold: float | None = None) -> BuildResult:
+    """Groups every alert at or above the threshold into cases. Each new case is created as "pending": its workflow is
+    not started here. Raises BuildBusy if another build is running. Progress is written to build_progress()."""
     settings = get_settings()
     threshold = settings.triage_threshold if threshold is None else threshold
-    max_new = settings.max_cases_per_run if max_new is None else max_new
     if not _build_lock.acquire(blocking=False):
         raise BuildBusy("a case build is already running")
     try:
-        result = _build(db, threshold, max_new, settings.model_alerts_per_account)
+        with _progress_lock:
+            _progress.update(running=True, done=0, total=0, summary=None, error=None)
+        result = _build(db, threshold, settings.model_alerts_per_account)
+        with _progress_lock:
+            _progress.update(running=False, summary=result.summary())
+    except Exception as exc:
+        with _progress_lock:
+            _progress.update(running=False, error=str(exc)[:500])
+        raise
     finally:
         _build_lock.release()
     invalidate()
     return result
+
+
+def start_build_in_background() -> None:
+    """Runs build_cases in its own thread (the Build cases button). Progress is polled through build_progress()."""
+    if _build_lock.locked():
+        raise BuildBusy("a case build is already running")
+    # Shown as running before the thread starts, so the page keeps polling from the first request.
+    with _progress_lock:
+        _progress.update(running=True, done=0, total=0, summary=None, error=None)
+
+    def run() -> None:
+        from app.db.session import SessionLocal
+
+        try:
+            with SessionLocal() as db:
+                build_cases(db)
+        except BuildBusy:
+            log.info("case build requested while another build runs; ignored")
+        except Exception:
+            log.exception("case build failed")
+
+    threading.Thread(target=run, name="case-build", daemon=True).start()
 
 
 def cap_model_alerts(rows: list[AlertRow], cap: int) -> tuple[list[AlertRow], dict[str, int]]:
@@ -127,7 +165,7 @@ class _Codes:
         return existing
 
 
-def _build(db: Session, threshold: float, max_new: int, model_cap: int) -> BuildResult:
+def _build(db: Session, threshold: float, model_cap: int) -> BuildResult:
     rows = [AlertRow(*r) for r in db.execute(
         select(Alert.id, Alert.account_id, Alert.risk_score, Alert.ts, Alert.rules, Alert.source)
         .where(Alert.source.in_(("rules", "model")), Alert.risk_score >= threshold)
@@ -142,7 +180,10 @@ def _build(db: Session, threshold: float, max_new: int, model_cap: int) -> Build
     scores = {acct: max(r.risk_score for r in rs) for acct, rs in by_account.items()}
     links = _linked_pairs(db, set(scores))
     active = _active_cases(db, set(scores))
-    for comp in g.components(scores, links):
+    components = g.components(scores, links)
+    with _progress_lock:
+        _progress["total"] = len(components)
+    for done, comp in enumerate(components, start=1):
         plan = g.plan_component(comp.accounts, active, scores)
         if plan.kind == g.PLAN_DEFER:
             result.deferred += 1
@@ -153,15 +194,10 @@ def _build(db: Session, threshold: float, max_new: int, model_cap: int) -> Build
             else:
                 result.unchanged += 1
         elif plan.kind == g.PLAN_NEW:
-            if result.created >= max_new:
-                result.queued += 1
-                continue
-            job = _create_case(db, plan, by_account, comp.best_score, left_out)
-            if job is None:
-                result.unchanged += 1
-            else:
+            if _create_case(db, plan, by_account, comp.best_score, left_out):
                 result.created += 1
-                result.jobs.append(job)
+            else:
+                result.unchanged += 1
         elif plan.kind == g.PLAN_ADD:
             if _grow_case(db, plan, by_account, active, left_out):
                 result.added += 1
@@ -169,6 +205,8 @@ def _build(db: Session, threshold: float, max_new: int, model_cap: int) -> Build
                 result.unchanged += 1
         else:
             result.unchanged += 1
+        with _progress_lock:
+            _progress["done"] = done
     return result
 
 
@@ -226,12 +264,13 @@ def _linked_alert_ids(db: Session, alert_ids: list[int]) -> set[int]:
 
 
 def _create_case(db: Session, plan: g.Plan, by_account: dict[str, list[AlertRow]], best_score: float,
-                 left_out: dict[str, int]) -> Job | None:
-    """Opens one case for the component's free accounts. Its primary alert is the highest-scoring one. Returns None if
-    a concurrent change took one of the accounts first (the unique indexes refused the links)."""
+                 left_out: dict[str, int]) -> bool:
+    """Opens one pending case for the component's free accounts. Its primary alert is the highest-scoring one. Its
+    workflow is not started here (see run_selected). Returns False if a concurrent change took one of the accounts first
+    (the unique indexes refused the links)."""
     alerts = [r for acct in plan.accounts for r in by_account[acct]]
     primary = max(alerts, key=lambda r: (r.risk_score, -r.id))
-    case = Case(alert_id=primary.id, account_id=primary.account_id, status="open", risk_score=best_score, state={})
+    case = Case(alert_id=primary.id, account_id=primary.account_id, status="pending", risk_score=best_score, state={})
     db.add(case)
     try:
         db.flush()
@@ -248,17 +287,8 @@ def _create_case(db: Session, plan: g.Plan, by_account: dict[str, list[AlertRow]
     except IntegrityError:
         db.rollback()
         log.warning("case build: a member changed while its case was being created; component skipped")
-        return None
-    raw = db.get(Alert, primary.id).raw_json or {}
-    return Job(
-        case_id=case.id,
-        alert_id=primary.id,
-        account_id=primary.account_id,
-        alert_ts=primary.ts.isoformat(),
-        rules=tuple(primary.rules or []),
-        risk=primary.risk_score,
-        txn_ids=tuple(int(i) for i in raw.get("txn_ids", [])),
-    )
+        return False
+    return True
 
 
 def _grow_case(db: Session, plan: g.Plan, by_account: dict[str, list[AlertRow]],
@@ -338,13 +368,43 @@ def _flag_members_changed(db: Session, case: Case, reason: str) -> None:
     case.state = state
 
 
-def start_jobs(jobs: list[Job]) -> None:
-    """Runs the new cases' workflows in one background thread, one after another, so LLM calls stay within the
-    free-tier limits."""
-    if jobs:
-        threading.Thread(target=_run_jobs, args=(jobs,), name="case-jobs", daemon=True).start()
+_run_lock = threading.Lock()  # one workflow at a time across all requests, to keep within the LLM rate limits
+
+
+def run_selected(db: Session, case_ids: list[int]) -> dict[str, Any]:
+    """Starts the audit timeline (the workflow) for selected pending cases. Each becomes open (running) now, and the
+    workflows run in one background thread, one case at a time. A case that is not pending is skipped, with the reason."""
+    queued: list[Job] = []
+    skipped: list[dict[str, Any]] = []
+    for case_id in dict.fromkeys(case_ids):  # keeps the order, drops duplicates
+        case = db.get(Case, case_id)
+        if case is None:
+            skipped.append({"case_id": case_id, "reason": "not found"})
+            continue
+        if case.status != "pending":
+            skipped.append({"case_id": case_id, "reason": f"case is {case.status}, not pending"})
+            continue
+        alert = db.get(Alert, case.alert_id)
+        case.status = "open"
+        write_event(db, case.id, "grouping", "run_requested", {"alert_id": alert.id})
+        queued.append(Job(
+            case_id=case.id,
+            alert_id=alert.id,
+            account_id=alert.account_id,
+            alert_ts=alert.ts.isoformat(),
+            rules=tuple(alert.rules or []),
+            risk=alert.risk_score,
+            txn_ids=tuple(int(i) for i in (alert.raw_json or {}).get("txn_ids", [])),
+        ))
+    db.commit()
+    invalidate()
+    if queued:
+        threading.Thread(target=_run_jobs, args=(queued,), name="case-jobs", daemon=True).start()
+    return {"queued": len(queued), "skipped": skipped}
 
 
 def _run_jobs(jobs: list[Job]) -> None:
-    for job in jobs:
-        run_case(job.case_id, job.alert_id, job.account_id, job.alert_ts, list(job.rules), job.risk, list(job.txn_ids))
+    with _run_lock:
+        for job in jobs:
+            run_case(job.case_id, job.alert_id, job.account_id, job.alert_ts, list(job.rules), job.risk,
+                     list(job.txn_ids))

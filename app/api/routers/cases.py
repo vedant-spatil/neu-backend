@@ -164,19 +164,31 @@ def open_case(
 
 
 @router.post("/cases/build", status_code=status.HTTP_202_ACCEPTED)
-def build_cases_now(
-    background: BackgroundTasks,
-    _: User = Depends(_admin),
-    db: Session = Depends(db_session),
-) -> dict[str, int]:
-    """Groups the alerts into cases now (admin). The same build runs after each sync. Running it again adds nothing
-    that is already there. New cases' workflows run in the background."""
+def build_cases_now(_: User = Depends(_admin)) -> dict[str, bool]:
+    """Starts building every case (admin). The build runs in the background; poll /cases/build/status for progress.
+    Running it again adds nothing that is already there. No workflow starts here."""
     try:
-        result = membership.build_cases(db)
+        membership.start_build_in_background()
     except membership.BuildBusy:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a case build is already running")
-    membership.start_jobs(result.jobs)
-    return result.summary()
+    return {"started": True}
+
+
+@router.get("/cases/build/status")
+def build_cases_status(_: User = Depends(_admin)) -> dict[str, Any]:
+    """Progress of the running build, or of the last one: running, done and total components, summary, error."""
+    return membership.build_progress()
+
+
+class RunIn(BaseModel):
+    case_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+@router.post("/cases/run", status_code=status.HTTP_202_ACCEPTED)
+def run_cases(body: RunIn, _: User = Depends(_admin), db: Session = Depends(db_session)) -> dict[str, Any]:
+    """Starts the audit timeline for the selected pending cases (admin). Cases that are not pending are skipped, with
+    the reason. The workflows run one at a time in the background."""
+    return membership.run_selected(db, body.case_ids)
 
 
 class CasePage(BaseModel):

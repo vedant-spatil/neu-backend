@@ -104,7 +104,7 @@ def decide_membership(active_case_status: str | None) -> str:
     takes it as an addendum, and its SAR is marked stale. Approved and closed cases are never changed."""
     if active_case_status is None:
         return NEW_CASE
-    if active_case_status in ("open", "failed", "awaiting_review"):
+    if active_case_status in ("pending", "open", "failed", "awaiting_review"):
         return ADD
     if active_case_status in ("approved", "closed"):
         return NEW_CASE

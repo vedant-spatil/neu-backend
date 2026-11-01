@@ -80,3 +80,10 @@ def test_failed_and_awaiting_review_cases_take_new_members() -> None:
 def test_accounts_keep_the_order_given() -> None:
     plan = g.plan_component(("C", "A", "B"), {})
     assert plan.accounts == ("C", "A", "B")
+
+
+def test_a_pending_case_takes_its_linked_accounts() -> None:
+    plan = g.plan_component(("A", "B"), {"A": (5, "pending")})
+    assert plan.kind == g.PLAN_ADD
+    assert plan.case_id == 5
+    assert plan.accounts == ("B",)

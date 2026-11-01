@@ -41,8 +41,6 @@ class Settings(BaseSettings):
     triage_model: str = "rules"
     triage_model_run: str = ""
     triage_score_threshold: float = 0.6
-    # Most new cases one case build starts (each runs the LLM workflow). Others wait for the next build.
-    max_cases_per_run: int = 10
     # Most model alerts (per edge) grouped per account. The highest-scoring ones are kept.
     model_alerts_per_account: int = 20
 
