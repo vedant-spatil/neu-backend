@@ -26,7 +26,8 @@ def match_party(name: str, dob: str | None, country: str | None) -> list[dict[st
     body = {"queries": {"q1": {"schema": "Person", "properties": props}}}
 
     hits: list[dict[str, Any]] = []
-    with httpx.Client(timeout=5.0) as client:
+    # yente runs on a small container with a 1 GB cap; a 5 s read timeout failed on the first slow search.
+    with httpx.Client(timeout=30.0) as client:
         for ds in DATASETS:
             r = client.post(
                 f"{s.yente_url}/match/{ds}",

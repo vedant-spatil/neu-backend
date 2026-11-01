@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import (
@@ -334,13 +335,21 @@ def assign_case(
 
 @router.get("/cases/{case_id}/identities")
 def case_identities(case_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, str]:
-    """The names behind the case's PARTY tokens, for the investigator's view. Each view is written to the audit trail."""
+    """The names behind the case's PARTY tokens, for the investigator's view. A view is written to the audit trail, at most
+    once per user per 15 minutes, since the case page asks for the names each time it loads."""
     case = get_visible_case(db, user, case_id)
     token = (case.state or {}).get("identity_map")
     if not token:
         return {}
     names = decrypt_map(token)
-    write_event(db, case.id, "review", "identities_viewed", {"tokens": len(names), "by_user_id": user.id})
+    last = db.execute(
+        select(CaseEvent).where(CaseEvent.case_id == case.id, CaseEvent.kind == "identities_viewed")
+        .order_by(CaseEvent.id.desc()).limit(1)
+    ).scalars().first()
+    recent = (last is not None and last.payload_json.get("by_user_id") == user.id
+              and datetime.now(UTC) - last.created_at < timedelta(minutes=15))
+    if not recent:
+        write_event(db, case.id, "review", "identities_viewed", {"tokens": len(names), "by_user_id": user.id})
     return names
 
 

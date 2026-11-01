@@ -175,6 +175,14 @@ def complete_json(
                 last_err = LlmError(f"HTTP {resp.status_code}")
                 time.sleep(_wait_seconds(resp, attempt))
                 continue
+            if resp.status_code == 400 and "tool_use_failed" in resp.text:
+                # Groq could not parse the forced tool call. The usual cause is an answer cut off at the token limit,
+                # so the retry gets a larger budget.
+                last_err = LlmError("tool_use_failed")
+                max_completion_tokens = int(max_completion_tokens * 1.5)
+                req = build(model, system, user, schema_name, schema, max_completion_tokens)
+                time.sleep(2.0 * (attempt + 1))
+                continue
             # Not retryable: bad request, bad key, or model not available to this account.
             raise LlmError(f"{provider} {model} rejected: HTTP {resp.status_code}: {resp.text[:300]}")
         except LlmError:

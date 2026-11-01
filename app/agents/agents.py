@@ -23,7 +23,7 @@ from app.services.pii import encrypt_map
 
 WINDOW = timedelta(hours=48)
 MAX_COUNTERPARTIES = 10
-LIGHT_MAX_TOKENS = 800
+LIGHT_MAX_TOKENS = 1200  # typology answers were cut off at 800 tokens, which Groq reports as tool_use_failed
 HEAVY_MAX_TOKENS = 2000
 
 
