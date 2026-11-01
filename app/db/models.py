@@ -116,6 +116,35 @@ class Case(Base):
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
 
 
+class CaseAlert(Base):
+    """An alert that belongs to a case. An alert is in at most one active case (active = its case is not superseded)."""
+
+    __tablename__ = "case_alerts"
+    __table_args__ = (Index("uq_case_alerts_alert_active", "alert_id", unique=True, postgresql_where=text("active")),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True)
+    alert_id: Mapped[int] = mapped_column(ForeignKey("alerts.id"), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CaseAccount(Base):
+    """An account that belongs to a case. An account is in at most one active case."""
+
+    __tablename__ = "case_accounts"
+    __table_args__ = (
+        Index("uq_case_accounts_account_active", "account_id", unique=True, postgresql_where=text("active")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(16), default="subject", server_default="subject")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Notification(Base):
     """In-app notification for one user. Messages are generic and carry no case content."""
 
