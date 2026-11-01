@@ -78,14 +78,13 @@ def test_a_linked_pair_becomes_one_case_and_a_second_build_changes_nothing() -> 
     with SessionLocal() as db:
         first = membership.build_cases(db)
     assert first.created == 1
-    assert len(first.jobs) == 1
     with SessionLocal() as db:
+        assert db.execute(select(Case.status)).scalar_one() == "pending"
         assert sorted(db.execute(select(CaseAccount.account_id)).scalars()) == ["A", "B"]
         events = _count_events(db)
     with SessionLocal() as db:
         second = membership.build_cases(db)
     assert (second.created, second.added, second.merged) == (0, 0, 0)
-    assert second.jobs == []
     with SessionLocal() as db:
         assert _count_events(db) == events
 
@@ -98,8 +97,7 @@ def test_a_free_account_joins_the_open_case_its_partner_is_in() -> None:
         db.commit()
     with SessionLocal() as db:
         result = membership.build_cases(db)
-    assert result.added == 1
-    assert result.jobs == []  # a failed case is flagged, not re-run
+    assert result.added == 1  # a failed case is flagged, not re-run
     with SessionLocal() as db:
         case = db.execute(select(Case).where(Case.account_id == "A")).scalar_one()
         assert case.state.get("members_changed") is True

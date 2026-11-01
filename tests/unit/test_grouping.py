@@ -68,6 +68,7 @@ def test_component_score_is_its_best_member() -> None:
 
 @pytest.mark.parametrize("status, expected", [
     (None, g.NEW_CASE),
+    ("pending", g.ADD),
     ("open", g.ADD),
     ("failed", g.ADD),
     ("awaiting_review", g.ADD),
