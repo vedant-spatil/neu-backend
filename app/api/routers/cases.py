@@ -310,10 +310,12 @@ def rerun_case(
     user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> CaseOut:
-    """Reruns the workflow of a failed case, on a new LangGraph thread. The events of the failed run are kept."""
+    """Reruns the workflow of a failed case, or of a case awaiting review (not yet decided), on a new LangGraph thread.
+    The events of the earlier run are kept."""
     case = get_visible_case(db, user, case_id)
-    if case.status != "failed":
-        raise HTTPException(status_code=409, detail=f"case is {case.status}; only failed cases can be rerun")
+    if case.status not in ("failed", "awaiting_review"):
+        raise HTTPException(status_code=409,
+                            detail=f"case is {case.status}; only failed cases or cases awaiting review can be rerun")
     alert = db.get(Alert, case.alert_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="alert not found")
