@@ -15,6 +15,7 @@ from app.db.models import Alert, Case
 from app.orchestration.graph import get_graph
 from app.services.audit import write_event
 from app.services.cache import invalidate
+from app.services.errors import describe_error
 from app.services.telemetry import timed
 
 log = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ def run_case(case_id: int, alert_id: int, account_id: str, alert_ts: str, rules:
             graph.invoke(initial, config)
     except Exception as exc:
         log.exception("case %s run failed", case_id)
-        _mark_failed(case_id, str(exc))
+        _mark_failed(case_id, describe_error(exc))
     finally:
         invalidate()
 
