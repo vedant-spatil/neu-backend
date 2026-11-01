@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from app.db.models import Alert, Case, CaseAccount, CaseAlert, CaseEvent, Transaction
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 from app.services import membership
 
 TS = datetime(2022, 9, 1, 10, 0)
@@ -22,10 +22,17 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    with SessionLocal() as db:
-        db.execute(text("TRUNCATE case_events, case_alerts, case_accounts, cases, alerts, transactions "
-                        "RESTART IDENTITY CASCADE"))
-        db.commit()
+    # case_events is append-only (a trigger refuses TRUNCATE). This session turns triggers off to clear the throwaway
+    # database; the production rule is unchanged.
+    with engine.connect() as conn:
+        conn.execute(text("SET session_replication_role = replica"))
+        try:
+            conn.execute(text("TRUNCATE case_events, case_alerts, case_accounts, cases, alerts, transactions "
+                              "RESTART IDENTITY CASCADE"))
+            conn.commit()
+        finally:
+            conn.execute(text("SET session_replication_role = DEFAULT"))
+            conn.commit()
     yield
 
 
