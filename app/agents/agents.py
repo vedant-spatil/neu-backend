@@ -18,6 +18,7 @@ from app.orchestration.prompts import (
 )
 from app.services import graph_store, llm, pii, sanctions
 from app.services.audit import write_event
+from app.services.errors import describe_error
 from app.services.pii import encrypt_map
 
 WINDOW = timedelta(hours=48)
@@ -102,7 +103,7 @@ def flow_tracer(db: Session, state: dict[str, Any]) -> dict[str, Any]:
             "cycle": graph_store.run_template("cycle", acct=acct, **w),
         }
     except Exception as exc:  # noqa: BLE001
-        write_event(db, state["case_id"], "flow_tracer", "error", {"error": str(exc)})
+        write_event(db, state["case_id"], "flow_tracer", "error", {"error": describe_error(exc)})
         return {"failures": [f"flow_tracer: {type(exc).__name__}"]}
     write_event(db, state["case_id"], "flow_tracer", "done", {k: len(v) for k, v in paths.items()})
     return {"paths": paths}
@@ -123,7 +124,7 @@ def screening(db: Session, state: dict[str, Any]) -> dict[str, Any]:
             for h in sanctions.match_party(p.name, p.dob, p.country):
                 hits.append({"party_token_account": acct, **h})
     except Exception as exc:  # noqa: BLE001
-        write_event(db, state["case_id"], "screening", "error", {"error": str(exc)})
+        write_event(db, state["case_id"], "screening", "error", {"error": describe_error(exc)})
         return {"failures": [f"screening: {type(exc).__name__}"]}
     write_event(db, state["case_id"], "screening", "done", {"hits": len(hits)})
     return {"screening_hits": hits}
@@ -180,7 +181,7 @@ def typology(db: Session, state: dict[str, Any]) -> dict[str, Any]:
             max_completion_tokens=LIGHT_MAX_TOKENS,
         )
     except llm.LlmError as exc:
-        write_event(db, state["case_id"], "typology", "error", {"error": str(exc)})
+        write_event(db, state["case_id"], "typology", "error", {"error": describe_error(exc)})
         return {"failures": ["typology: llm failed"]}
     allowed = _evidence_ids(state)
     clean = []
@@ -233,7 +234,7 @@ def report_writer(db: Session, state: dict[str, Any]) -> dict[str, Any]:
             max_completion_tokens=HEAVY_MAX_TOKENS,
         )
     except llm.LlmError as exc:
-        write_event(db, state["case_id"], "report_writer", "error", {"error": str(exc)})
+        write_event(db, state["case_id"], "report_writer", "error", {"error": describe_error(exc)})
         return {"failures": ["report_writer: llm failed"]}
     allowed = _evidence_ids(state)
     cited = [i for i in out.get("cited_txn_ids", []) if i in allowed][:MAX_CITATIONS]
