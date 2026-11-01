@@ -22,6 +22,7 @@ from app.services.audit import write_event
 from app.services.cache import get_or_compute, invalidate
 from app.services.dashboard import dashboard_payload, trends_payload
 from app.services.notify import notify, notify_admins
+from app.services.pii import decrypt_map
 
 router = APIRouter(prefix="/api", tags=["cases"])
 
@@ -288,6 +289,18 @@ def assign_case(
     write_event(db, case.id, "assignment", "assigned", {"user_id": target.id})
     notify(db, target.id, "case_assigned", f"Case {case.id} was assigned to you.", link=f"/cases/{case.id}")
     return _case_out(case)
+
+
+@router.get("/cases/{case_id}/identities")
+def case_identities(case_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)) -> dict[str, str]:
+    """The names behind the case's PARTY tokens, for the investigator's view. Each view is written to the audit trail."""
+    case = get_visible_case(db, user, case_id)
+    token = (case.state or {}).get("identity_map")
+    if not token:
+        return {}
+    names = decrypt_map(token)
+    write_event(db, case.id, "review", "identities_viewed", {"tokens": len(names), "by_user_id": user.id})
+    return names
 
 
 @router.post("/cases/{case_id}/rerun", response_model=CaseOut, status_code=status.HTTP_202_ACCEPTED)

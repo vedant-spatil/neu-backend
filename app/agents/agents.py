@@ -8,7 +8,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.models import Party, SarDraft, Transaction, TriageScore
+from app.db.models import Case, Party, SarDraft, Transaction, TriageScore
 from app.orchestration.prompts import (
     SAR_SCHEMA,
     SAR_SYSTEM,
@@ -18,6 +18,7 @@ from app.orchestration.prompts import (
 )
 from app.services import graph_store, llm, pii, sanctions
 from app.services.audit import write_event
+from app.services.pii import encrypt_map
 
 WINDOW = timedelta(hours=48)
 MAX_COUNTERPARTIES = 10
@@ -190,6 +191,14 @@ def typology(db: Session, state: dict[str, Any]) -> dict[str, Any]:
     return {"typologies": clean}
 
 
+def _store_identities(db: Session, case_id: int, identities: dict[str, str]) -> None:
+    """Keeps the token -> name map encrypted on the case. Only the investigator's view decrypts it; the LLM never sees it."""
+    case = db.get(Case, case_id)
+    if case is not None:
+        case.state = {**(case.state or {}), "identity_map": encrypt_map(identities)}
+        db.commit()
+
+
 def report_writer(db: Session, state: dict[str, Any]) -> dict[str, Any]:
     s = get_settings()
     parties = {
@@ -200,6 +209,7 @@ def report_writer(db: Session, state: dict[str, Any]) -> dict[str, Any]:
     }
     names = [p.name for p in parties.values()]
     token_of = {acct: f"PARTY_{i:03d}" for i, acct in enumerate([state["account_id"], *state.get("counterparties", [])], 1)}
+    _store_identities(db, state["case_id"], {token_of[acct]: p.name for acct, p in parties.items() if acct in token_of})
     evidence = {
         "subject_token": token_of.get(state["account_id"]),
         "alert_ts": state["alert_ts"],
