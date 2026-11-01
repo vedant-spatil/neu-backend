@@ -10,7 +10,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field
-from sqlalchemy import Text, cast, func, select
+from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -171,6 +171,8 @@ def list_cases(
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status", max_length=32),
+    search: str | None = Query(None, alias="q", max_length=64,
+                               description="a case number, an alert number, or an account prefix"),
     user: User = Depends(current_user),
     db: Session = Depends(db_session),
 ) -> CasePage:
@@ -181,6 +183,13 @@ def list_cases(
         q = q.where(scope)
     if status_filter:
         q = q.where(Case.status == status_filter)
+    if search and search.strip():
+        term = search.strip()
+        if term.isdigit():
+            number = int(term)
+            q = q.where(or_(Case.id == number, Case.alert_id == number))
+        else:
+            q = q.where(Case.account_id.startswith(term, autoescape=True))
     total = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
     rows = db.execute(q.order_by(Case.id.desc()).offset(offset).limit(limit)).scalars()
     return CasePage(total=total, offset=offset, limit=limit, items=[_case_out(c) for c in rows])
