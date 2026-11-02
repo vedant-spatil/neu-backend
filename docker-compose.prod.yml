@@ -4,11 +4,18 @@
 #               then scripts/issue_cert.sh
 # Start:        docker compose -f docker-compose.prod.yml up -d
 # Logs:         docker compose -f docker-compose.prod.yml logs -f api
+#               or CloudWatch Logs group /aml/prod (streams: api, nginx, yente, elasticsearch)
 #
 # Only nginx publishes ports (80, 443). Elasticsearch, yente and the API stay on the internal Docker network.
 # The databases are external: Supabase Postgres (APP_DATABASE_URL) and Neo4j Aura (APP_NEO4J_URI).
 # mem_limit and cpus are caps, not expected usage. The box is a t3a.medium (4 GiB RAM, 2 vCPU) with swap.
+#
+# Container logs go to CloudWatch through the awslogs driver. The instance role (scripts/aws/01-ec2-role.sh) gives
+# the permission. mode=non-blocking: if CloudWatch is unreachable, the app keeps running and logs are dropped.
 name: aml-prod
+
+x-awslogs-region: &awslogs-region ${AWS_REGION:-ap-south-1}
+x-awslogs-group: &awslogs-group ${AWS_LOG_GROUP:-/aml/prod}
 
 services:
   elasticsearch:
@@ -27,6 +34,15 @@ services:
       retries: 30
     mem_limit: 1g
     cpus: "0.5"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: elasticsearch
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   yente:
     image: ghcr.io/opensanctions/yente:latest
@@ -42,6 +58,15 @@ services:
         condition: service_healthy
     mem_limit: 768m
     cpus: "0.3"   # only answers sanctions lookups; idle most of the time
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: yente
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   api:
     build:
@@ -69,6 +94,15 @@ services:
     # 1.5 GB. Measure with `docker stats` after a sync and tighten if it stays low.
     mem_limit: 1536m
     cpus: "1.5"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: api
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   nginx:
     image: nginx:1.27-alpine
@@ -88,8 +122,17 @@ services:
         condition: service_healthy
     mem_limit: 128m
     cpus: "0.2"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: nginx
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
-  # Only used by scripts/issue_cert.sh (profile "cert"), never started by a plain "up -d".
+  # Only used by scripts/issue_cert.sh and scripts/aws/11-yente-route.sh (profile "cert"), never started by "up -d".
   certbot:
     image: certbot/certbot:latest
     profiles: ["cert"]

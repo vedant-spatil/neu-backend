@@ -1,0 +1,9 @@
+# Yente route for the AgentCore agent (plan phase 2). Adds the nginx mounts for the yente vhost and its basic-auth file.
+# Written by scripts/aws/11-yente-route.sh. On the box, add it to COMPOSE_FILE in .env:
+#   COMPOSE_FILE=docker-compose.prod.yml:docker-compose.yente-route.yml
+# Without it, nginx ignores the yente vhost and nothing is exposed.
+services:
+  nginx:
+    volumes:
+      - ./docker/nginx/yente/yente.conf:/etc/nginx/conf.d/yente.conf:ro
+      - ./secrets/yente.htpasswd:/etc/nginx/yente.htpasswd:ro

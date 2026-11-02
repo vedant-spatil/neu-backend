@@ -1,0 +1,33 @@
+{
+  "agent": {
+    "run_as_user": "root",
+    "metrics_collection_interval": 60
+  },
+  "metrics": {
+    "namespace": "AML/EC2",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "aggregation_dimensions": [
+      ["InstanceId"]
+    ],
+    "metrics_collected": {
+      "mem": {
+        "measurement": ["mem_used_percent"]
+      },
+      "swap": {
+        "measurement": ["swap_used_percent"]
+      },
+      "disk": {
+        "resources": ["/"],
+        "measurement": ["used_percent"],
+        "drop_device": true
+      },
+      "cpu": {
+        "resources": ["*"],
+        "measurement": ["usage_active"],
+        "totalcpu": true
+      }
+    }
+  }
+}

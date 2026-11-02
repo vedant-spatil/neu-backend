@@ -19,3 +19,7 @@ mainvenv/
 # Model checkpoints and tool caches: not source, never pushed
 models/
 graphify-out/
+
+# Box-only secrets and generated nginx config for the yente route (scripts/aws/11-yente-route.sh)
+secrets/
+docker/nginx/yente/yente.conf
