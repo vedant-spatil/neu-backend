@@ -8,7 +8,7 @@ from sqlalchemy import Date, and_, cast, func, select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.models import Alert, Case, Decision, User
+from app.db.models import Alert, Case, Decision, Transaction, User
 from app.services.access import case_scope
 
 
@@ -74,6 +74,12 @@ def dashboard_payload(db: Session, user: User) -> dict[str, Any]:
         db.execute(select(func.floor(Alert.risk_score * 10), func.count()).group_by(text("1"))).all()
     )
     payload["score_histogram"] = {f"{int(k) / 10:.1f}": v for k, v in buckets.items()}
+    # Alert rate: alerts above threshold out of all transactions. Admin only, cached with the rest of the dashboard.
+    alert_count = db.execute(select(func.count()).select_from(Alert).where(Alert.risk_score >= _threshold())).scalar_one()
+    payload["alert_rate"] = {
+        "alerts": alert_count,
+        "transactions": db.execute(select(func.count()).select_from(Transaction)).scalar_one(),
+    }
     return payload
 
 
