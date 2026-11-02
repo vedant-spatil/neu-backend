@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
+import botocore.session
 import httpx
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -37,6 +40,8 @@ class Request:
     url: str
     headers: dict[str, str]
     body: dict[str, Any]
+    # The exact bytes sent. Set when the request is signed (SigV4), so the signature matches what goes on the wire.
+    payload: bytes | None = None
 
 
 def _cache_key(provider: str, model: str, system: str, user: str, schema: dict[str, Any]) -> str:
@@ -86,11 +91,19 @@ def _groq_parse(payload: dict[str, Any], tool_name: str) -> dict[str, Any]:
 
 # ---- Amazon Bedrock: Converse API -----------------------------------------------------------------------------
 
+def _sigv4_headers(url: str, payload: bytes, region: str) -> dict[str, str]:
+    """Signs a POST to Bedrock with AWS credentials from the instance role or the AWS_* environment (service "bedrock")."""
+    creds = botocore.session.get_session().get_credentials()
+    if creds is None:
+        raise LlmError("no AWS credentials for Bedrock (instance role or AWS_* variables) and no BEDROCK_API_KEY")
+    aws_req = AWSRequest(method="POST", url=url, data=payload, headers={"Content-Type": "application/json"})
+    SigV4Auth(creds.get_frozen_credentials(), "bedrock", region).add_auth(aws_req)
+    return dict(aws_req.headers.items())
+
+
 def _bedrock_request(model: str, system: str, user: str, schema_name: str, schema: dict[str, Any],
                      max_tokens: int) -> Request:
     settings = get_settings()
-    if not settings.bedrock_api_key:
-        raise LlmError("BEDROCK_API_KEY not set")
     # The model ID contains ":" (e.g. ...-v1:0), so it must be percent-encoded in the path.
     url = f"https://bedrock-runtime.{settings.bedrock_region}.amazonaws.com/model/{quote(model, safe='')}/converse"
     body = {
@@ -106,8 +119,12 @@ def _bedrock_request(model: str, system: str, user: str, schema_name: str, schem
             "toolChoice": {"tool": {"name": schema_name}},
         },
     }
-    headers = {"Authorization": f"Bearer {settings.bedrock_api_key}", "Content-Type": "application/json"}
-    return Request(url, headers, body)
+    if settings.bedrock_api_key:
+        headers = {"Authorization": f"Bearer {settings.bedrock_api_key}", "Content-Type": "application/json"}
+        return Request(url, headers, body)
+    # No bearer key: IAM (SigV4). Preferred on the box, where the instance role provides credentials.
+    payload = json.dumps(body).encode()
+    return Request(url, _sigv4_headers(url, payload, settings.bedrock_region), body, payload)
 
 
 def _bedrock_parse(payload: dict[str, Any], tool_name: str) -> dict[str, Any]:
@@ -126,9 +143,10 @@ PROVIDERS: dict[str, tuple[Callable[..., Request], Callable[[dict[str, Any], str
 
 
 def _post(req: Request) -> httpx.Response:
-    """Single place that sends HTTP. Tests replace this function."""
+    """Single place that sends HTTP. Tests replace this function. Signed requests send their exact bytes."""
+    content = req.payload if req.payload is not None else json.dumps(req.body).encode()
     with httpx.Client(timeout=TIMEOUT_SECONDS) as client:
-        return client.post(req.url, headers=req.headers, json=req.body)
+        return client.post(req.url, headers=req.headers, content=content)
 
 
 def _wait_seconds(resp: httpx.Response, attempt: int) -> float:
@@ -174,6 +192,14 @@ def complete_json(
             if resp.status_code in (429, 500, 502, 503):
                 last_err = LlmError(f"HTTP {resp.status_code}")
                 time.sleep(_wait_seconds(resp, attempt))
+                continue
+            if resp.status_code == 400 and "tool_use_failed" in resp.text:
+                # Groq could not parse the forced tool call. The usual cause is an answer cut off at the token limit,
+                # so the retry gets a larger budget.
+                last_err = LlmError("tool_use_failed")
+                max_completion_tokens = int(max_completion_tokens * 1.5)
+                req = build(model, system, user, schema_name, schema, max_completion_tokens)
+                time.sleep(2.0 * (attempt + 1))
                 continue
             # Not retryable: bad request, bad key, or model not available to this account.
             raise LlmError(f"{provider} {model} rejected: HTTP {resp.status_code}: {resp.text[:300]}")

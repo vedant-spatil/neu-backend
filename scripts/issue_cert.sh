@@ -24,9 +24,9 @@ if [ "${1:-}" = "--renew" ]; then
   exit 0
 fi
 
-# 1. Databases, search, sanctions and the API. nginx waits for the API to be healthy.
+# 1. Search, sanctions and the API. Postgres (Supabase) and Neo4j (Aura) are external. nginx waits for the API to be healthy.
 #    --build: aml-api is built on this host, not pulled from a registry (first run has no image yet).
-$COMPOSE up -d --build postgres elasticsearch yente neo4j api
+$COMPOSE up -d --build elasticsearch yente api
 
 # 2. nginx refuses to start without a certificate file, so create a short-lived placeholder first.
 docker run --rm -v "$LE_VOLUME:/etc/letsencrypt" alpine:3.20 sh -c "

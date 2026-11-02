@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     observability_log_group: str | None = None
     observability_region: str | None = None
 
+    # Where a case run executes (plan: AgentCore for case runs, phase 2). "local" runs the LangGraph workflow in this
+    # process (development and fallback). "agentcore" invokes the AgentCore Runtime agent at agentcore_runtime_arn.
+    case_runner: str = "local"
+    agentcore_runtime_arn: str = ""
+    agentcore_region: str | None = None  # defaults to bedrock_region
+    # Set when the agent reaches yente through the public nginx route (basic auth). Empty for the internal URL.
+    yente_basic_user: str = ""
+    yente_basic_password: str = ""
+
     # Disabled: Celery and Redis are commented out (see app/tasks/__init__.py).
     # redis_url: str = "redis://localhost:6379/0"
 
@@ -91,9 +100,18 @@ class Settings(BaseSettings):
             raise ValueError("TRIAGE_MODEL=xgb needs TRIAGE_MODEL_RUN (the model_version whose scores cases read)")
 
 
+    def check_case_runner(self) -> None:
+        """CASE_RUNNER=agentcore needs the runtime ARN. Without it every case run would fail at the first call."""
+        if self.case_runner not in ("local", "agentcore"):
+            raise ValueError(f"CASE_RUNNER must be local or agentcore, not {self.case_runner!r}")
+        if self.case_runner == "agentcore" and not self.agentcore_runtime_arn:
+            raise ValueError("CASE_RUNNER=agentcore needs AGENTCORE_RUNTIME_ARN")
+
+
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
     settings.check_production()
     settings.check_triage()
+    settings.check_case_runner()
     return settings

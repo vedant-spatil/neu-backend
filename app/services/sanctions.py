@@ -26,7 +26,10 @@ def match_party(name: str, dob: str | None, country: str | None) -> list[dict[st
     body = {"queries": {"q1": {"schema": "Person", "properties": props}}}
 
     hits: list[dict[str, Any]] = []
-    with httpx.Client(timeout=5.0) as client:
+    # yente runs on a small container with a 1 GB cap; a 5 s read timeout failed on the first slow search.
+    # The AgentCore agent reaches yente through the public nginx route, which needs basic auth (plan phase 2).
+    auth = (s.yente_basic_user, s.yente_basic_password) if s.yente_basic_user else None
+    with httpx.Client(timeout=30.0, auth=auth) as client:
         for ds in DATASETS:
             r = client.post(
                 f"{s.yente_url}/match/{ds}",

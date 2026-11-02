@@ -52,6 +52,10 @@ def _await_human(state: CaseState) -> dict[str, Any]:
         if case is not None:
             case.status = "awaiting_review"
             db.commit()
+        if review["failures"]:
+            # A branch failed, so the case is waiting for review without its screening, typology or flow results. Say so in
+            # the audit trail; the investigator decides whether to restart it.
+            write_event(db, state["case_id"], "review", "incomplete", {"failures": review["failures"]})
     decision = interrupt(review)  # resumed with Command(resume=decision_dict)
     return {"decision": decision, "status": "awaiting_review"}
 

@@ -11,8 +11,10 @@ from langgraph.types import Command
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db.models import Alert, Case, CaseAccount, CaseAlert
 from app.orchestration.graph import get_graph
+from app.services.agentcore import invoke_case
 from app.services.audit import write_event
 from app.services.cache import invalidate
 from app.services.errors import describe_error
@@ -71,8 +73,30 @@ def start_case(db: Session, alert: Alert) -> Case:
 
 def run_case(case_id: int, alert_id: int, account_id: str, alert_ts: str, rules: list[str], risk: float,
              txn_ids: list[int], attempt: int = 0) -> None:
-    """Background task entry point. Errors are logged and recorded as a failed case."""
+    """Background task entry point: runs the case where CASE_RUNNER says. Errors are logged and recorded as a failed case."""
     _clear_members_changed(case_id)
+    if get_settings().case_runner == "agentcore":
+        _run_on_agentcore({
+            "case_id": case_id, "alert_id": alert_id, "account_id": account_id, "alert_ts": alert_ts,
+            "rules": list(rules), "risk": risk, "txn_ids": list(txn_ids), "attempt": attempt,
+        })
+        return
+    run_case_local(case_id, alert_id, account_id, alert_ts, rules, risk, txn_ids, attempt)
+
+
+def _run_on_agentcore(payload: dict[str, Any]) -> None:
+    try:
+        invoke_case(payload)
+    except Exception as exc:  # any failure is recorded on the case, not raised to the caller
+        log.exception("case %s AgentCore run failed", payload["case_id"])
+        _mark_failed(payload["case_id"], describe_error(exc))
+    finally:
+        invalidate()
+
+
+def run_case_local(case_id: int, alert_id: int, account_id: str, alert_ts: str, rules: list[str], risk: float,
+                   txn_ids: list[int], attempt: int = 0) -> None:
+    """The LangGraph workflow in this process. The AgentCore agent calls this too, with CASE_RUNNER=local."""
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id(case_id, attempt)}, "recursion_limit": RECURSION_LIMIT}
     initial: dict[str, Any] = {

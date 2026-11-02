@@ -4,28 +4,20 @@
 #               then scripts/issue_cert.sh
 # Start:        docker compose -f docker-compose.prod.yml up -d
 # Logs:         docker compose -f docker-compose.prod.yml logs -f api
+#               or CloudWatch Logs group /aml/prod (streams: api, nginx, yente, elasticsearch)
 #
-# Only nginx publishes ports (80, 443). Postgres, Elasticsearch, yente, Neo4j and the API stay on the
-# internal Docker network. mem_limit values are caps, not expected usage.
+# Only nginx publishes ports (80, 443). Elasticsearch, yente and the API stay on the internal Docker network.
+# The databases are external: Supabase Postgres (APP_DATABASE_URL) and Neo4j Aura (APP_NEO4J_URI).
+# mem_limit and cpus are caps, not expected usage. The box is a t3a.medium (4 GiB RAM, 2 vCPU) with swap.
+#
+# Container logs go to CloudWatch through the awslogs driver. The instance role (scripts/aws/01-ec2-role.sh) gives
+# the permission. mode=non-blocking: if CloudWatch is unreachable, the app keeps running and logs are dropped.
 name: aml-prod
 
-services:
-  postgres:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: aml
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: aml
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aml -d aml"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-    mem_limit: 512m
+x-awslogs-region: &awslogs-region ${AWS_REGION:-ap-south-1}
+x-awslogs-group: &awslogs-group ${AWS_LOG_GROUP:-/aml/prod}
 
+services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
     restart: unless-stopped
@@ -41,6 +33,16 @@ services:
       timeout: 5s
       retries: 30
     mem_limit: 1g
+    cpus: "0.5"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: elasticsearch
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   yente:
     image: ghcr.io/opensanctions/yente:latest
@@ -55,23 +57,16 @@ services:
       elasticsearch:
         condition: service_healthy
     mem_limit: 768m
-
-  neo4j:
-    image: neo4j:5-community
-    restart: unless-stopped
-    environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
-      NEO4J_server_memory_heap_initial__size: 512m
-      NEO4J_server_memory_heap_max__size: 512m
-      NEO4J_server_memory_pagecache_size: 256m
-    volumes:
-      - neo4jdata:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-    mem_limit: 1g
+    cpus: "0.3"   # only answers sanctions lookups; idle most of the time
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: yente
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   api:
     build:
@@ -95,7 +90,19 @@ services:
     depends_on:
       yente:
         condition: service_started
-    mem_limit: 1g
+    # Freed by moving Postgres and Neo4j out of this box. A case build and a CSV sync peak near 1 GB, so the cap is
+    # 1.5 GB. Measure with `docker stats` after a sync and tighten if it stays low.
+    mem_limit: 1536m
+    cpus: "1.5"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: api
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
   nginx:
     image: nginx:1.27-alpine
@@ -114,8 +121,18 @@ services:
       api:
         condition: service_healthy
     mem_limit: 128m
+    cpus: "0.2"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: *awslogs-region
+        awslogs-group: *awslogs-group
+        awslogs-stream: nginx
+        awslogs-create-group: "true"
+        mode: non-blocking
+        max-buffer-size: 16m
 
-  # Only used by scripts/issue_cert.sh (profile "cert"), never started by a plain "up -d".
+  # Only used by scripts/issue_cert.sh and scripts/aws/11-yente-route.sh (profile "cert"), never started by "up -d".
   certbot:
     image: certbot/certbot:latest
     profiles: ["cert"]
@@ -124,9 +141,7 @@ services:
       - certbot_www:/var/www/certbot
 
 volumes:
-  pgdata:
   esdata:
-  neo4jdata:
   uploads:
   letsencrypt:
   certbot_www:
